@@ -227,7 +227,10 @@
 //#define TFT_RST  33  // Reset pin (could connect to Arduino RESET pin)
 #define TFT_BL   26  // LED back-light
 
-#define TOUCH_CS 12     // Chip select pin (T_CS) of touch screen
+// Touch is now handled by the standalone XPT2046_Touchscreen library on a
+// dedicated HSPI bus (see src/main.cpp), NOT by TFT_eSPI - so TOUCH_CS is
+// intentionally left undefined here.
+// #define TOUCH_CS 14     // Chip select pin (T_CS) of touch screen
 
 //#define TFT_WR 22    // Write strobe for modified Raspberry Pi TFT only
 

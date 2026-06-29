@@ -18,9 +18,19 @@
 #include <TFT_eSPI.h>
 #include <LittleFS.h>
 #include <PNGdec.h>
+#include <SPI.h>
+#include <XPT2046_Touchscreen.h>
 #include <time.h>
 
 #include "config.h"
+
+// Touch is on hold until the hardware is sorted.
+//  TOUCH_ENABLED 0 -> all touch polling is skipped, so there are NO phantom
+//                     page switches and the serial log stays clean.
+//  TOUCH_DEBUG   1 -> stream the raw XPT2046 point (touched/x/y/z) to serial.
+// Set TOUCH_ENABLED to 1 once the touch panel works.
+#define TOUCH_ENABLED 0
+#define TOUCH_DEBUG   0
 
 // ----------------------------------------------------------------------------
 //  Colours / layout
@@ -54,6 +64,28 @@ TFT_eSPI    tft       = TFT_eSPI();
 TFT_eSprite headerSpr = TFT_eSprite(&tft);   // 480 x HEADER_H
 TFT_eSprite rowSpr    = TFT_eSprite(&tft);   // 480 x ROW_H, reused per row
 static bool spritesOK = false;
+
+// ----------------------------------------------------------------------------
+//  Touch (XPT2046) on its OWN dedicated HSPI bus, SEPARATE from the display's
+//  VSPI bus. Sharing the display bus gave frozen/garbage readings; a private
+//  bus is the reliable arrangement (per the Bytes N Bits ILI9341 + XPT2046
+//  tutorial / Arduino forum thread).
+//
+//  >>> REWIRE the 4 touch signal pins to these GPIOs (none shared with the
+//      display). T_IRQ does NOT need wiring - we poll over SPI. <<<
+//      T_CLK -> 25,  T_DIN(MOSI) -> 32,  T_DO(MISO) -> 39,  T_CS -> 33
+// ----------------------------------------------------------------------------
+#define T_CLK_PIN  25
+#define T_MOSI_PIN 32
+#define T_MISO_PIN 39
+#define T_CS_PIN   33
+SPIClass            touchSPI(HSPI);
+XPT2046_Touchscreen ts(T_CS_PIN);     // poll mode (no IRQ pin needed)
+
+// Raw-to-screen mapping (tune from TOUCH_DEBUG output). XPT2046 raw values run
+// ~0..4095; these map the usable touch range onto the 480x320 panel.
+static int gTouchMinX = 300, gTouchMaxX = 3800;
+static int gTouchMinY = 300, gTouchMaxY = 3800;
 
 // ----------------------------------------------------------------------------
 //  Match model
@@ -94,12 +126,29 @@ static long   gTrackedId    = -1;
 static char   gPrevStatus[12] = "";
 static time_t gSecondHalfKO = 0;
 
-// Hero card geometry
+// ----------------------------------------------------------------------------
+//  Pages (multi-screen). A footer nav bar at the bottom holds < and > arrows;
+//  tapping them cycles through the screens. Touch comes from the XPT2046
+//  controller (TOUCH_CS in User_Setup.h), calibrated once and saved to LittleFS.
+// ----------------------------------------------------------------------------
+enum Page { PAGE_FEATURED = 0, PAGE_ALL, PAGE_RESULTS, PAGE_COUNT };
+static int gPage = PAGE_FEATURED;
+static uint32_t gLastContentSig = 0;   // last painted content hash (see loop)
+static int  gRenderedPage = -1;        // page currently on screen
+static long gHeroDrawnId  = -1;        // id of the match whose card is on screen
+static const char *kPageTitle[PAGE_COUNT] = { "FEATURED", "ALL MATCHES", "RESULTS" };
+
+static const int FOOTER_H    = 40;
+static const int FOOTER_Y    = SCREEN_H - FOOTER_H;    // 280
+static const int CONTENT_TOP = HEADER_H + 4;           // 46
+static const int CONTENT_BOT = FOOTER_Y - 2;           // 278
+static const int CONTENT_H   = CONTENT_BOT - CONTENT_TOP;
+
+// Hero card geometry (centred in the content band on the FEATURED page)
 static const int HERO_X = 6;
-static const int HERO_Y = HEADER_H + 4;
-static const int HERO_W = SCREEN_W - 12;
 static const int HERO_H = 158;
-static const int LIST_TOP = HERO_Y + HERO_H + 6;   // compact rows start here
+static const int HERO_Y = CONTENT_TOP + (CONTENT_H - HERO_H) / 2;
+static const int HERO_W = SCREEN_W - 12;
 
 // ----------------------------------------------------------------------------
 //  Helpers
@@ -363,19 +412,6 @@ static void drawFlagCircle(int cx, int cy, int d, const char *tla) {
   tft.drawCircle(cx, cy, r, COL_CARD_TOP);     // subtle ring
 }
 
-// Five-point outline star (favourite icon, like the demo).
-static void drawStar(int cx, int cy, int rOuter, uint16_t col) {
-  float rInner = rOuter * 0.42f;
-  int px = 0, py = 0;
-  for (int i = 0; i <= 10; i++) {
-    float ang = -HALF_PI + i * (PI / 5.0f);
-    float rr = (i & 1) ? rInner : rOuter;
-    int x = cx + (int)(rr * cosf(ang));
-    int y = cy + (int)(rr * sinf(ang));
-    if (i > 0) tft.drawLine(px, py, x, y, col);
-    px = x; py = y;
-  }
-}
 
 // ----------------------------------------------------------------------------
 //  Drawing (sprite based)
@@ -387,46 +423,53 @@ static const int HERO_TIMER_Y = HERO_Y + 116;
 
 // Draws the red elapsed-time clock (mm:ss since kick-off) under the score.
 // The free tier gives no match minute, so this is wall-clock since kick-off.
-static void drawLiveTimer() {
+static void drawLiveTimer(bool force = false) {
   int cx = HERO_X + HERO_W / 2;
+
+  // Build the label + colour first so we can skip repainting when it hasn't
+  // changed (otherwise "HALF TIME" / the minute would flicker every second).
+  char t[12];
+  uint16_t col;
+  if (!strcmp(heroMatch.status, "PAUSED")) {
+    strcpy(t, "HALF TIME");
+    col = COL_HT;
+  } else {
+    // Match minute. No live minute from the API, so:
+    //  - 1st half: minutes since kick-off (accurate, no break yet)
+    //  - 2nd half: if we caught the real restart (Option D anchor) -> 45 + time
+    //    since restart (exact); otherwise fall back to (elapsed - 15) estimate.
+    time_t now = time(nullptr);
+    long mins;
+    if (heroMatch.secondHalf) {
+      if (gTrackedId == heroMatch.id && gSecondHalfKO > 0)
+        mins = 45 + (long)((now - gSecondHalfKO) / 60);
+      else
+        mins = (long)((now - heroMatch.koEpoch) / 60) - 15;
+    } else {
+      mins = (long)((now - heroMatch.koEpoch) / 60);
+    }
+    if (mins < 0) mins = 0;
+    if      (!heroMatch.secondHalf && mins > 45) snprintf(t, sizeof(t), "45+'");
+    else if ( heroMatch.secondHalf && mins > 90) snprintf(t, sizeof(t), "90+'");
+    else                                         snprintf(t, sizeof(t), "%ld'", mins);
+    col = COL_LIVE;
+  }
+
+  static char last[12] = "";
+  if (!force && strcmp(t, last) == 0) return;   // unchanged -> don't repaint
+  strcpy(last, t);
+
   tft.fillRect(cx - 70, HERO_TIMER_Y - 13, 140, 26, COL_CARD);   // clear
   tft.setTextDatum(MC_DATUM);
   setUiFont(20);
-
-  if (!strcmp(heroMatch.status, "PAUSED")) {
-    tft.setTextColor(COL_HT, COL_CARD);
-    tft.drawString("HALF TIME", cx, HERO_TIMER_Y);
-    return;
-  }
-  // Match minute. No live minute from the API, so:
-  //  - 1st half: minutes since kick-off (accurate, no break yet)
-  //  - 2nd half: if we caught the real restart (Option D anchor) -> 45 + time
-  //    since restart (exact); otherwise fall back to (elapsed - 15) estimate.
-  time_t now = time(nullptr);
-  long mins;
-  if (heroMatch.secondHalf) {
-    if (gTrackedId == heroMatch.id && gSecondHalfKO > 0)
-      mins = 45 + (long)((now - gSecondHalfKO) / 60);
-    else
-      mins = (long)((now - heroMatch.koEpoch) / 60) - 15;
-  } else {
-    mins = (long)((now - heroMatch.koEpoch) / 60);
-  }
-  if (mins < 0) mins = 0;
-  char t[10];
-  if      (!heroMatch.secondHalf && mins > 45) snprintf(t, sizeof(t), "45+'");
-  else if ( heroMatch.secondHalf && mins > 90) snprintf(t, sizeof(t), "90+'");
-  else                                         snprintf(t, sizeof(t), "%ld'", mins);
-  tft.setTextColor(COL_LIVE, COL_CARD);
+  tft.setTextColor(col, COL_CARD);
   tft.drawString(t, cx, HERO_TIMER_Y);
 }
 
-// Featured card matching the demo: breadcrumb, circular flags, full names,
-// big white score, red live timer, faint favourite stars.
-static void drawLiveHero(const Match &m) {
-  bool live = isLive(m);
-
-  // Card background + subtle border
+// STATIC part of the card: background, breadcrumb, circular flags, team names.
+// These only change when the featured match itself changes, so we draw them
+// once (the flag PNG decode is the slow bit) and leave them alone afterwards.
+static void drawHeroStatic(const Match &m) {
   tft.fillRoundRect(HERO_X, HERO_Y, HERO_W, HERO_H, 8, COL_CARD);
   tft.drawRoundRect(HERO_X, HERO_Y, HERO_W, HERO_H, 8, COL_CARD_TOP);
 
@@ -440,15 +483,13 @@ static void drawLiveHero(const Match &m) {
   tft.setTextColor(COL_BREAD, COL_CARD);
   tft.drawString(crumb, HERO_X + 14, HERO_Y + 12);
 
-  // Circular flags + favourite stars
+  // Circular flags
   int d = 70;
   int fcy = HERO_Y + 70;
   int hxc = HERO_X + 70;
   int axc = HERO_X + HERO_W - 70;
   drawFlagCircle(hxc, fcy, d, m.home);
   drawFlagCircle(axc, fcy, d, m.away);
-  drawStar(HERO_X + 22, fcy, 9, COL_STAR);
-  drawStar(HERO_X + HERO_W - 22, fcy, 9, COL_STAR);
 
   // Full team names under the flags
   tft.setTextDatum(MC_DATUM);
@@ -456,21 +497,29 @@ static void drawLiveHero(const Match &m) {
   tft.setTextColor(COL_TEXT, COL_CARD);
   tft.drawString(m.homeName, hxc, fcy + d / 2 + 18);
   tft.drawString(m.awayName, axc, fcy + d / 2 + 18);
+}
 
-  // Centre: big white score (or kick-off time for upcoming)
+// DYNAMIC part: the score / kick-off + timer. Cheap to repaint, so this runs on
+// every update. It clears only its own zone over the card, never the whole card.
+static void drawHeroDynamic(const Match &m) {
   int cx = HERO_X + HERO_W / 2;
+
+  // Clear just the score zone (over the card colour), then draw the score.
+  tft.fillRect(cx - 90, HERO_SCORE_Y - 22, 180, 44, COL_CARD);
+  setUiFont(36);
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextColor(COL_TEXT, COL_CARD);
+
   if (matchHasScore(m)) {
     char sc[12];
     snprintf(sc, sizeof(sc), "%d - %d", m.homeGoals, m.awayGoals);
-    setUiFont(36);
-    tft.setTextColor(COL_TEXT, COL_CARD);
-    tft.setTextDatum(MC_DATUM);
     tft.drawString(sc, cx, HERO_SCORE_Y);
-    if (live) drawLiveTimer();
-  } else {
-    setUiFont(36);
-    tft.setTextColor(COL_TEXT, COL_CARD);
-    tft.setTextDatum(MC_DATUM);
+    if (isLive(m)) {
+      drawLiveTimer(true);                                  // force a fresh paint
+    } else {                                                // finished: no timer
+      tft.fillRect(cx - 70, HERO_TIMER_Y - 13, 140, 26, COL_CARD);
+    }
+  } else {                                                  // upcoming: kick-off
     tft.drawString(m.kickoff, cx, HERO_SCORE_Y);
     setUiFont(16);
     tft.setTextColor(COL_SCHED, COL_CARD);
@@ -479,11 +528,16 @@ static void drawLiveHero(const Match &m) {
 }
 
 // WiFi signal as 4 bars; level 0..4 derived from RSSI.
-static void drawWifiBars(TFT_eSprite &s, int x, int y, int level, uint16_t on) {
-  for (int i = 0; i < 4; i++) {
-    int bh = 4 + i * 4;                       // 4,8,12,16 px tall
-    s.fillRect(x + i * 6, y - bh, 4, bh, i < level ? on : COL_HEADER + 0x2104);
-  }
+// WiFi glyph: a base dot + three concentric arcs opening upward, like a phone's
+// WiFi icon. (cx,cy) is the dot centre. drawArc uses 0 deg = 6 o'clock going
+// clockwise, so 180 deg is straight up and 135..225 is the top fan. Lit arcs
+// use `on`; the rest are drawn dim so the full glyph shape always shows.
+static void drawWifiBars(TFT_eSprite &s, int cx, int cy, int level, uint16_t on) {
+  const uint16_t dim = 0x4208;                              // muted grey
+  s.drawArc(cx, cy, 14, 12, 135, 225, level >= 4 ? on : dim, COL_HEADER, true);
+  s.drawArc(cx, cy,  9,  7, 135, 225, level >= 3 ? on : dim, COL_HEADER, true);
+  s.drawArc(cx, cy,  4,  2, 135, 225, level >= 2 ? on : dim, COL_HEADER, true);
+  s.fillCircle(cx, cy, 2, level >= 1 ? on : dim);           // base dot
 }
 
 static int wifiLevel() {
@@ -496,7 +550,7 @@ static int wifiLevel() {
   return 1;
 }
 
-static void drawHeader(int secsToRefresh) {
+static void drawHeader() {
   TFT_eSprite &s = headerSpr;
   s.fillSprite(COL_HEADER);
 
@@ -504,8 +558,8 @@ static void drawHeader(int secsToRefresh) {
   bool online    = connected && gOnline;
   uint16_t stCol = online ? COL_SCHED : COL_LIVE;
 
-  // Left: WiFi signal bars + ONLINE/OFFLINE (same Open Sans font as the card)
-  drawWifiBars(s, 12, HEADER_H / 2 + 8, wifiLevel(), stCol);
+  // Left: WiFi signal glyph + ONLINE/OFFLINE (same Open Sans font as the card)
+  drawWifiBars(s, 18, HEADER_H / 2 + 7, wifiLevel(), stCol);
   setUiFont(s, 16);
   s.setTextDatum(ML_DATUM);
   s.setTextColor(stCol, COL_HEADER);
@@ -518,11 +572,6 @@ static void drawHeader(int secsToRefresh) {
   s.setTextDatum(MR_DATUM);
   s.setTextColor(COL_TEXT, COL_HEADER);
   s.drawString(when, SCREEN_W - 12, HEADER_H / 2 - 1);
-
-  // Refresh countdown bar along the bottom edge
-  if (secsToRefresh < 0) secsToRefresh = 0;
-  int barW = (int)((long)SCREEN_W * (REFRESH_SECONDS - secsToRefresh) / REFRESH_SECONDS);
-  s.fillRect(0, HEADER_H - 3, barW, 3, COL_ACCENT);
 
   s.pushSprite(0, 0);
 }
@@ -573,11 +622,11 @@ static void drawRow(int idx, const Match &m, int screenY) {
 }
 
 static void drawMessage(const char *msg, uint16_t colour) {
-  tft.fillRect(0, ROW_TOP, SCREEN_W, SCREEN_H - ROW_TOP, COL_BG);
+  tft.fillRect(0, CONTENT_TOP, SCREEN_W, CONTENT_H, COL_BG);
   tft.setTextDatum(MC_DATUM);
   setUiFont(20);
   tft.setTextColor(colour, COL_BG);
-  tft.drawString(msg, SCREEN_W / 2, (ROW_TOP + SCREEN_H) / 2);
+  tft.drawString(msg, SCREEN_W / 2, (CONTENT_TOP + CONTENT_BOT) / 2);
 }
 
 // Watch the hero match's status across polls; capture the second-half kick-off
@@ -598,37 +647,116 @@ static void trackHalfTime(const Match &m) {
   gPrevStatus[sizeof(gPrevStatus) - 1] = '\0';
 }
 
-static void render(int secsToRefresh) {
-  drawHeader(secsToRefresh);
+// ----------------------------------------------------------------------------
+//  Footer navigation bar  (< page-title >  + page dots)
+// ----------------------------------------------------------------------------
+// Touch zones live inside the footer band; left third = previous, right third
+// = next. Generous widths so the arrows are easy to hit with a fingertip.
+static const int NAV_ZONE_W = 130;   // px from each edge that counts as a tap
+
+static void drawArrow(int cx, int cy, int s, bool right, uint16_t col) {
+  if (right) tft.fillTriangle(cx - s, cy - s, cx - s, cy + s, cx + s, cy, col);
+  else       tft.fillTriangle(cx + s, cy - s, cx + s, cy + s, cx - s, cy, col);
+}
+
+static void drawFooter() {
+  tft.fillRect(0, FOOTER_Y, SCREEN_W, FOOTER_H, COL_HEADER);
+  tft.drawFastHLine(0, FOOTER_Y, SCREEN_W, COL_CARD_TOP);
+  int midY = FOOTER_Y + FOOTER_H / 2;
+
+  // Tappable arrow buttons near each edge
+  tft.drawRoundRect(10, FOOTER_Y + 6, 52, FOOTER_H - 12, 6, COL_CARD_TOP);
+  tft.drawRoundRect(SCREEN_W - 62, FOOTER_Y + 6, 52, FOOTER_H - 12, 6, COL_CARD_TOP);
+  drawArrow(36, midY, 9, false, COL_ACCENT);             // <
+  drawArrow(SCREEN_W - 36, midY, 9, true, COL_ACCENT);   // >
+
+  // Centre: current page title
+  setUiFont(16);
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextColor(COL_TEXT, COL_HEADER);
+  tft.drawString(kPageTitle[gPage], SCREEN_W / 2, midY - 4);
+
+  // Page dots
+  int gap = 14, x0 = SCREEN_W / 2 - (PAGE_COUNT - 1) * gap / 2;
+  int dy = FOOTER_Y + FOOTER_H - 7;
+  for (int i = 0; i < PAGE_COUNT; i++) {
+    if (i == gPage) tft.fillCircle(x0 + i * gap, dy, 3, COL_ACCENT);
+    else            tft.drawCircle(x0 + i * gap, dy, 3, COL_DIM);
+  }
+}
+
+// ----------------------------------------------------------------------------
+//  Page bodies
+// ----------------------------------------------------------------------------
+static bool predAll(const Match &m)      { (void)m; return true; }
+static bool predFinished(const Match &m) { return !strcmp(m.status, "FINISHED"); }
+
+// Generic list page: draws matches passing pred() as compact rows.
+static void drawListPage(bool (*pred)(const Match &), const char *emptyMsg) {
+  int maxRows = CONTENT_H / ROW_H;
+  int shown = 0;
+  for (int i = 0; i < matchCount && shown < maxRows; i++) {
+    if (pred && !pred(matches[i])) continue;
+    drawRow(shown, matches[i], CONTENT_TOP + shown * ROW_H);
+    shown++;
+  }
+  if (shown == 0) drawMessage(emptyMsg, COL_DIM);
+}
+
+// Featured page: the big hero card for the top-ranked match. The heavy static
+// card is redrawn only when the match changes or we just switched to this page;
+// otherwise just the score/timer zone updates in place (no flash).
+static void drawFeatured() {
+  heroMatch = matches[0];
+  trackHalfTime(matches[0]);
+
+  bool newCard = (matches[0].id != gHeroDrawnId) || (gPage != gRenderedPage);
+  if (newCard) {
+    tft.fillRect(0, CONTENT_TOP, SCREEN_W, CONTENT_H, COL_BG);  // clear band once
+    drawHeroStatic(matches[0]);
+    gHeroDrawnId = matches[0].id;
+  }
+  drawHeroDynamic(matches[0]);
+
+  heroShown  = true;
+  heroIsLive = isLive(matches[0]);
+}
+
+// A cheap hash of everything that affects the on-screen content. The loop only
+// repaints the screen when this changes, so a fetch that returns identical data
+// no longer triggers a jarring full-screen redraw.
+static uint32_t contentSignature() {
+  uint32_t h = 2166136261u;                 // FNV-1a
+  auto mix = [&](uint32_t v) { h ^= v; h *= 16777619u; };
+  mix((uint32_t)matchCount);
+  mix((uint32_t)gPage);
+  for (int i = 0; i < matchCount; i++) {
+    const Match &m = matches[i];
+    mix((uint32_t)m.id);
+    mix((uint32_t)(m.homeGoals * 257 + m.awayGoals));
+    for (const char *p = m.status; *p; p++) mix((uint8_t)*p);
+  }
+  return h;
+}
+
+static void render() {
+  drawHeader();
   heroShown = heroIsLive = false;
 
   if (matchCount == 0) {
-    drawMessage(statusLine, COL_DIM);
-    return;
-  }
-
-  tft.fillRect(0, ROW_TOP, SCREEN_W, SCREEN_H - ROW_TOP, COL_BG);
-
-  // Feature the top match (live, else next upcoming) in the hero card.
-  int firstRow = 0;
-  if (isLive(matches[0]) || isUpcoming(matches[0])) {
-    heroMatch  = matches[0];
-    trackHalfTime(matches[0]);
-    drawLiveHero(matches[0]);
-    heroShown  = true;
-    heroIsLive = isLive(matches[0]);
-    firstRow   = 1;
-
-    // Remaining matches as compact rows below the card.
-    int avail = (SCREEN_H - LIST_TOP) / ROW_H;
-    int shown = 0;
-    for (int i = firstRow; i < matchCount && shown < avail; i++, shown++)
-      drawRow(shown, matches[i], LIST_TOP + shown * ROW_H);
+    drawMessage(statusLine, COL_DIM);   // clears the band itself
+    gHeroDrawnId = -1;                  // force a fresh card when matches return
+  } else if (gPage == PAGE_FEATURED) {
+    drawFeatured();        // clears the band itself, only when the card changes
   } else {
-    // No live/upcoming match: plain list from the top.
-    int rows = min(matchCount, MAX_ROWS);
-    for (int i = 0; i < rows; i++) drawRow(i, matches[i], ROW_TOP + i * ROW_H);
+    // List pages: clear and redraw the rows (cheap, no flag decode).
+    tft.fillRect(0, CONTENT_TOP, SCREEN_W, CONTENT_H, COL_BG);
+    if (gPage == PAGE_RESULTS) drawListPage(predFinished, "No results yet");
+    else                       drawListPage(predAll,      "No matches");
   }
+
+  drawFooter();
+  gRenderedPage = gPage;
 }
 
 // ----------------------------------------------------------------------------
@@ -638,7 +766,7 @@ static void connectWiFi() {
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   strcpy(statusLine, "Connecting to WiFi...");
-  render(REFRESH_SECONDS);
+  render();
 
   Serial.printf("[WiFi] connecting to %s\n", WIFI_SSID);
   uint32_t start = millis();
@@ -656,7 +784,7 @@ static void connectWiFi() {
   } else {
     Serial.println("[WiFi] FAILED");
     strcpy(statusLine, "WiFi failed - check config.h");
-    render(REFRESH_SECONDS);
+    render();
   }
 }
 
@@ -798,6 +926,59 @@ static bool fetchMatches() {
 }
 
 // ----------------------------------------------------------------------------
+//  Touch (XPT2046_Touchscreen on the dedicated HSPI bus). No on-screen
+//  calibration step: raw points are mapped to screen pixels with the gTouch*
+//  constants (tune them from the TOUCH_DEBUG serial output).
+// ----------------------------------------------------------------------------
+static void setupTouch() {
+  touchSPI.begin(T_CLK_PIN, T_MISO_PIN, T_MOSI_PIN, T_CS_PIN);
+  ts.begin(touchSPI);
+  ts.setRotation(SCREEN_ROTATION);
+  Serial.println("[TOUCH] XPT2046 started on dedicated HSPI bus "
+                 "(CLK25 MISO39 MOSI32 CS33)");
+}
+
+// Poll the touchscreen; if an arrow button was tapped, switch pages and redraw.
+static void handleTouch() {
+#if !TOUCH_ENABLED
+  return;                                   // touch on hold - no polling at all
+#endif
+#if TOUCH_DEBUG
+  static uint32_t lastDbg = 0;
+  if (millis() - lastDbg > 200) {
+    lastDbg = millis();
+    bool t = ts.touched();
+    TS_Point p = ts.getPoint();
+    Serial.printf("[TOUCH] touched=%d  x=%4d y=%4d z=%4d\n", t, p.x, p.y, p.z);
+  }
+  return;
+#endif
+  static bool     down = false;
+  static uint32_t lastAct = 0;
+  bool pressed = ts.touched();
+
+  if (pressed && !down && millis() - lastAct > 250) {
+    down = true;
+    TS_Point p = ts.getPoint();
+    int sx = map(p.x, gTouchMinX, gTouchMaxX, 0, SCREEN_W);
+    int sy = map(p.y, gTouchMinY, gTouchMaxY, 0, SCREEN_H);
+    if (sy >= FOOTER_Y) {                       // only the footer band navigates
+      int prev = gPage;
+      if (sx <= NAV_ZONE_W)                 gPage = (gPage + PAGE_COUNT - 1) % PAGE_COUNT;
+      else if (sx >= SCREEN_W - NAV_ZONE_W) gPage = (gPage + 1) % PAGE_COUNT;
+      if (gPage != prev) {
+        Serial.printf("[NAV] page -> %s (raw %d,%d -> screen %d,%d)\n",
+                      kPageTitle[gPage], p.x, p.y, sx, sy);
+        render();
+        gLastContentSig = contentSignature();   // keep in sync after a page switch
+        lastAct = millis();
+      }
+    }
+  }
+  if (!pressed) down = false;
+}
+
+// ----------------------------------------------------------------------------
 //  Arduino entry points
 // ----------------------------------------------------------------------------
 void setup() {
@@ -835,29 +1016,43 @@ void setup() {
   Serial.printf("[SPRITE] alloc %s (free heap %u)\n",
                 spritesOK ? "ok" : "FAILED", ESP.getFreeHeap());
 
+  setupTouch();   // load or run touch calibration before we need the arrows
+
   connectWiFi();
   fetchMatches();
-  render(REFRESH_SECONDS);
+  render();
+  gLastContentSig = contentSignature();
 }
 
 void loop() {
   static uint32_t lastFetch = 0;
   static uint32_t lastTick  = 0;
+  static int      lastMin   = -1;
   uint32_t now = millis();
 
-  // First fetch happened in setup(); thereafter every REFRESH_SECONDS.
+  handleTouch();   // inert while TOUCH_ENABLED is 0
+
+  // Periodic data fetch. Repaint ONLY when the data actually changed, so an
+  // unchanged refresh no longer triggers a full-screen redraw.
   if (now - lastFetch >= (uint32_t)REFRESH_SECONDS * 1000UL) {
     lastFetch = now;
     fetchMatches();
-    render(REFRESH_SECONDS);
+    uint32_t sig = contentSignature();
+    if (sig != gLastContentSig) {
+      gLastContentSig = sig;
+      render();
+    }
   }
 
-  // Update header (clock + countdown bar) once per second, and blink the
-  // LIVE dot on the hero card so it reads as "live" without a match minute.
+  // Once per second: tick the live timer; refresh the header only when the
+  // displayed minute changes (so the clock isn't constantly repainting).
   if (now - lastTick >= 1000) {
     lastTick = now;
-    int elapsed = (now - lastFetch) / 1000;
-    drawHeader(REFRESH_SECONDS - elapsed);
-    if (heroShown && heroIsLive) drawLiveTimer();
+    struct tm t;
+    if (getLocalTime(&t, 5) && t.tm_min != lastMin) {
+      lastMin = t.tm_min;
+      drawHeader();
+    }
+    if (gPage == PAGE_FEATURED && heroShown && heroIsLive) drawLiveTimer();
   }
 }
