@@ -125,6 +125,8 @@ static Match heroMatch;             // copy of the featured match (for the timer
 static long   gTrackedId    = -1;
 static char   gPrevStatus[12] = "";
 static time_t gSecondHalfKO = 0;
+static time_t gLastPausedSeen = 0;  // wall-clock of the most recent PAUSED poll
+static bool   gAnyLive = false;     // any match in play -> poll faster (see loop)
 
 // ----------------------------------------------------------------------------
 //  Pages (multi-screen). A footer nav bar at the bottom holds < and > arrows;
@@ -433,21 +435,22 @@ static void drawLiveTimer(bool force = false) {
   if (!strcmp(heroMatch.status, "PAUSED")) {
     strcpy(t, "HALF TIME");
     col = COL_HT;
+  } else if (heroMatch.secondHalf &&
+             !(gTrackedId == heroMatch.id && gSecondHalfKO > 0)) {
+    // 2nd half, but we never saw the restart (e.g. the board was switched on
+    // mid-half). The free API gives no live minute, and "elapsed - 15" would
+    // over-count by first-half stoppage + the real break length - that's how
+    // 57' ends up shown as 64'. Print an honest label instead of a fake number.
+    strcpy(t, "2ND HALF");
+    col = COL_LIVE;
   } else {
-    // Match minute. No live minute from the API, so:
-    //  - 1st half: minutes since kick-off (accurate, no break yet)
-    //  - 2nd half: if we caught the real restart (Option D anchor) -> 45 + time
-    //    since restart (exact); otherwise fall back to (elapsed - 15) estimate.
+    // Accurate minute:
+    //  - 1st half: minutes since kick-off (no break yet)
+    //  - 2nd half: 45 + time since the restart we anchored ourselves
     time_t now = time(nullptr);
-    long mins;
-    if (heroMatch.secondHalf) {
-      if (gTrackedId == heroMatch.id && gSecondHalfKO > 0)
-        mins = 45 + (long)((now - gSecondHalfKO) / 60);
-      else
-        mins = (long)((now - heroMatch.koEpoch) / 60) - 15;
-    } else {
-      mins = (long)((now - heroMatch.koEpoch) / 60);
-    }
+    long mins = heroMatch.secondHalf
+                  ? 45 + (long)((now - gSecondHalfKO) / 60)
+                  : (long)((now - heroMatch.koEpoch) / 60);
     if (mins < 0) mins = 0;
     if      (!heroMatch.secondHalf && mins > 45) snprintf(t, sizeof(t), "45+'");
     else if ( heroMatch.secondHalf && mins > 90) snprintf(t, sizeof(t), "90+'");
@@ -633,14 +636,21 @@ static void drawMessage(const char *msg, uint16_t colour) {
 // the moment we see PAUSED -> IN_PLAY (Option D). Resets when the match changes.
 static void trackHalfTime(const Match &m) {
   if (m.id != gTrackedId) {
-    gTrackedId = m.id;
-    gSecondHalfKO = 0;
-    gPrevStatus[0] = '\0';
+    gTrackedId      = m.id;
+    gSecondHalfKO   = 0;
+    gLastPausedSeen = 0;
+    gPrevStatus[0]  = '\0';
   }
+  time_t now = time(nullptr);
+  if (!strcmp(m.status, "PAUSED")) gLastPausedSeen = now;   // refresh each break poll
+
   bool wasPaused = (strcmp(gPrevStatus, "PAUSED") == 0);
   bool nowLive   = (strcmp(m.status, "IN_PLAY") == 0);
   if (wasPaused && nowLive && gSecondHalfKO == 0) {
-    gSecondHalfKO = time(nullptr);
+    // The real restart happened somewhere between the last poll that still saw
+    // PAUSED and this one. Anchor to the midpoint of that window so the clock is
+    // off by at most half a poll interval, instead of trailing the whole one.
+    gSecondHalfKO = (gLastPausedSeen > 0) ? (gLastPausedSeen + now) / 2 : now;
     Serial.printf("[CLOCK] 2nd-half kickoff anchored for match %ld\n", m.id);
   }
   strncpy(gPrevStatus, m.status, sizeof(gPrevStatus) - 1);
@@ -708,7 +718,6 @@ static void drawListPage(bool (*pred)(const Match &), const char *emptyMsg) {
 // otherwise just the score/timer zone updates in place (no flash).
 static void drawFeatured() {
   heroMatch = matches[0];
-  trackHalfTime(matches[0]);
 
   bool newCard = (matches[0].id != gHeroDrawnId) || (gPage != gRenderedPage);
   if (newCard) {
@@ -921,6 +930,15 @@ static bool fetchMatches() {
 
   Serial.printf("[PARSE] %d matches\n", matchCount);
   sortMatches();
+
+  // Watch the top match's half-time transition on EVERY poll (independent of
+  // which page is showing) so the 2nd-half clock is anchored reliably, and note
+  // whether anything is live so loop() can poll faster while it matters.
+  gAnyLive = false;
+  for (int i = 0; i < matchCount; i++)
+    if (isLive(matches[i])) { gAnyLive = true; break; }
+  if (matchCount > 0) trackHalfTime(matches[0]);
+
   if (matchCount == 0) strcpy(statusLine, "No matches in range");
   return true;
 }
@@ -1033,8 +1051,13 @@ void loop() {
   handleTouch();   // inert while TOUCH_ENABLED is 0
 
   // Periodic data fetch. Repaint ONLY when the data actually changed, so an
-  // unchanged refresh no longer triggers a full-screen redraw.
-  if (now - lastFetch >= (uint32_t)REFRESH_SECONDS * 1000UL) {
+  // unchanged refresh no longer triggers a full-screen redraw. While a match is
+  // live we poll every ~20s (3 req/min, well under the free tier's 10/min) so
+  // the PAUSED->IN_PLAY restart is caught quickly and the 2nd-half clock anchors
+  // tightly; otherwise we use the configured interval.
+  uint32_t liveSecs  = (REFRESH_SECONDS < 20) ? (uint32_t)REFRESH_SECONDS : 20;
+  uint32_t fetchSecs = gAnyLive ? liveSecs : (uint32_t)REFRESH_SECONDS;
+  if (now - lastFetch >= fetchSecs * 1000UL) {
     lastFetch = now;
     fetchMatches();
     uint32_t sig = contentSignature();
