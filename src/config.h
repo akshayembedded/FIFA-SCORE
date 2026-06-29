@@ -5,8 +5,8 @@
 // =============================================================================
 
 // --- WiFi ---------------------------------------------------------------------
-#define WIFI_SSID      "SargasanHome"
-#define WIFI_PASSWORD  "Sargasan@123#"
+#define WIFI_SSID      "Hello"
+#define WIFI_PASSWORD  "12345678901"
 
 // --- football-data.org --------------------------------------------------------
 // Get a free token at https://www.football-data.org/client/register

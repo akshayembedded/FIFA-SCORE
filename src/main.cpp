@@ -3,6 +3,11 @@
 //  Data: football-data.org v4 API  (free tier)
 //
 //  Edit src/config.h with your WiFi + API token before uploading.
+//
+//  Rendering is done with TFT_eSprite (off-screen buffers) for flicker-free
+//  updates. A full 480x320 16bpp sprite would need ~307KB, which won't fit in
+//  the ESP32's RAM, so we use two reusable region sprites instead: one for the
+//  header bar and one row-height sprite that is redrawn and pushed per match.
 // =============================================================================
 
 #include <Arduino.h>
@@ -11,6 +16,8 @@
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <TFT_eSPI.h>
+#include <LittleFS.h>
+#include <PNGdec.h>
 #include <time.h>
 
 #include "config.h"
@@ -28,33 +35,71 @@
 #define COL_SCHED     0x07E0  // green
 #define COL_ROW_ALT   0x10A2  // very dark blue (alternate rows)
 #define COL_ACCENT    0x07FF  // cyan
+#define COL_CARD      0x0861  // live hero card background (near black)
+#define COL_CARD_TOP  0x18E3  // card border
+#define COL_FLAG_BG   0x4208  // flag placeholder tile
+#define COL_GOLD      0xFEA0  // trophy gold accent
+#define COL_BREAD     0x6C9F  // breadcrumb blue
+#define COL_STAR      0x8410  // faint star outline
 
-static const int SCREEN_W   = 480;
-static const int SCREEN_H   = 320;
-static const int HEADER_H   = 42;
-static const int ROW_H      = 38;
-static const int ROW_TOP    = HEADER_H + 4;
-static const int MAX_ROWS   = (SCREEN_H - ROW_TOP) / ROW_H;   // ~7 rows
-static const int MAX_MATCH  = 12;
+static const int SCREEN_W  = 480;
+static const int SCREEN_H  = 320;
+static const int HEADER_H  = 42;
+static const int ROW_H     = 38;
+static const int ROW_TOP   = HEADER_H + 4;
+static const int MAX_ROWS  = (SCREEN_H - ROW_TOP) / ROW_H;   // ~7 rows
+static const int MAX_MATCHES = 16;
 
-TFT_eSPI tft = TFT_eSPI();
+TFT_eSPI    tft       = TFT_eSPI();
+TFT_eSprite headerSpr = TFT_eSprite(&tft);   // 480 x HEADER_H
+TFT_eSprite rowSpr    = TFT_eSprite(&tft);   // 480 x ROW_H, reused per row
+static bool spritesOK = false;
 
 // ----------------------------------------------------------------------------
 //  Match model
 // ----------------------------------------------------------------------------
 struct Match {
-  char home[5];     // TLA, e.g. "ARS"
+  long id;          // football-data match id
+  char home[5];     // TLA, e.g. "ARG"
   char away[5];
+  char homeName[22];// full name, e.g. "South Africa"
+  char awayName[22];
+  time_t koEpoch;   // kick-off as UTC epoch (for the live clock)
+  bool   secondHalf;// half-time score is in -> match is in/after the 2nd half
   char comp[6];     // competition code
   int  homeGoals;
   int  awayGoals;
   char status[12];  // raw status from API
+  char utc[21];     // full UTC timestamp, used for sorting
   char kickoff[6];  // "HH:MM" local time
+  char stage[16];   // e.g. GROUP_STAGE, LAST_16
+  char group[10];   // e.g. GROUP_A (may be empty)
 };
 
-static Match matches[MAX_MATCH];
+static Match matches[MAX_MATCHES];
 static int   matchCount = 0;
 static char  statusLine[48] = "Starting...";
+static bool  gOnline = false;       // last data fetch reached the API
+static bool  gSmoothFonts = false;  // Open Sans VLW fonts found on LittleFS
+
+// Hero-card state (top featured match)
+static bool  heroShown    = false;  // a hero card is currently on screen
+static bool  heroIsLive   = false;  // that hero is an in-play match
+static Match heroMatch;             // copy of the featured match (for the timer)
+
+// Half-time anchor (Option D): when we observe the live PAUSED -> IN_PLAY
+// transition we record the real second-half kick-off, making the 2nd-half
+// minute exact instead of an estimate.
+static long   gTrackedId    = -1;
+static char   gPrevStatus[12] = "";
+static time_t gSecondHalfKO = 0;
+
+// Hero card geometry
+static const int HERO_X = 6;
+static const int HERO_Y = HEADER_H + 4;
+static const int HERO_W = SCREEN_W - 12;
+static const int HERO_H = 158;
+static const int LIST_TOP = HERO_Y + HERO_H + 6;   // compact rows start here
 
 // ----------------------------------------------------------------------------
 //  Helpers
@@ -73,15 +118,74 @@ static void copyTeamId(JsonObjectConst team, char *dst) {
   if (!dst[0]) strcpy(dst, "???");
 }
 
+// Copy a readable team name (prefers shortName, then full name) into dst.
+static void copyTeamName(JsonObjectConst team, char *dst, size_t n) {
+  const char *shortName = team["shortName"] | "";
+  const char *name      = team["name"]      | "";
+  const char *src = shortName[0] ? shortName : name;
+  strncpy(dst, src, n - 1);
+  dst[n - 1] = '\0';
+}
+
+// Days since 1970-01-01 for a civil date (Howard Hinnant's algorithm).
+static long daysFromCivil(int y, unsigned m, unsigned d) {
+  y -= m <= 2;
+  long era = (y >= 0 ? y : y - 399) / 400;
+  unsigned yoe = (unsigned)(y - era * 400);
+  unsigned doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+  unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+  return era * 146097L + (long)doe - 719468;
+}
+
+// Parse a UTC ISO timestamp ("2026-06-29T18:00:00Z") to a UTC epoch.
+static time_t isoToEpoch(const char *s) {
+  if (!s || strlen(s) < 19) return 0;
+  int Y = atoi(s), M = atoi(s + 5), D = atoi(s + 8);
+  int h = atoi(s + 11), mi = atoi(s + 14), se = atoi(s + 17);
+  return (time_t)(daysFromCivil(Y, M, D) * 86400L + h * 3600 + mi * 60 + se);
+}
+
 // Convert a UTC ISO timestamp ("2026-06-29T18:00:00Z") to local "HH:MM".
 static void utcToLocal(const char *utc, char *out) {
-  out[0] = '\0';
   if (!utc || strlen(utc) < 16) { strcpy(out, "--:--"); return; }
   int h = (utc[11] - '0') * 10 + (utc[12] - '0');
   int m = (utc[14] - '0') * 10 + (utc[15] - '0');
   int total = h * 60 + m + TZ_OFFSET_MINUTES;
   total = ((total % 1440) + 1440) % 1440;
   snprintf(out, 6, "%02d:%02d", total / 60, total % 60);
+}
+
+static bool isLive(const Match &m) {
+  return !strcmp(m.status, "IN_PLAY") || !strcmp(m.status, "PAUSED");
+}
+static bool isUpcoming(const Match &m) {
+  return !strcmp(m.status, "TIMED") || !strcmp(m.status, "SCHEDULED");
+}
+
+// Sort priority: live (0) -> upcoming (1) -> finished/other (2).
+static int statusRank(const Match &m) {
+  if (isLive(m))     return 0;
+  if (isUpcoming(m)) return 1;
+  return 2;
+}
+
+// Order matches: live first, then soonest upcoming, then most-recent results.
+static void sortMatches() {
+  for (int i = 0; i < matchCount - 1; i++) {
+    for (int j = 0; j < matchCount - 1 - i; j++) {
+      Match &a = matches[j], &b = matches[j + 1];
+      int ra = statusRank(a), rb = statusRank(b);
+      bool swap;
+      if (ra != rb) {
+        swap = ra > rb;
+      } else if (ra == 2) {
+        swap = strcmp(a.utc, b.utc) < 0;   // finished: newest first
+      } else {
+        swap = strcmp(a.utc, b.utc) > 0;   // live/upcoming: earliest first
+      }
+      if (swap) { Match t = a; a = b; b = t; }
+    }
+  }
 }
 
 // Returns a short status badge ("LIVE", "HT", "FT", or kickoff time) + colour.
@@ -97,94 +201,434 @@ static const char *badgeFor(const Match &m, uint16_t &colour) {
 }
 
 static bool matchHasScore(const Match &m) {
-  return strcmp(m.status, "TIMED") && strcmp(m.status, "SCHEDULED") &&
-         strcmp(m.status, "POSTPONED") && strcmp(m.status, "CANCELLED");
+  return !isUpcoming(m) && strcmp(m.status, "POSTPONED") && strcmp(m.status, "CANCELLED");
+}
+
+// Build a human label for the round/group, e.g. "GROUP B" or "ROUND OF 16".
+static void stageLabel(const Match &m, char *out, size_t n) {
+  if (m.group[0]) {                       // "GROUP_A" -> "GROUP A"
+    size_t i = 0;
+    for (; m.group[i] && i < n - 1; i++) out[i] = (m.group[i] == '_') ? ' ' : m.group[i];
+    out[i] = '\0';
+    return;
+  }
+  const char *s = m.stage;
+  if      (!strcmp(s, "GROUP_STAGE"))    strncpy(out, "GROUP STAGE",   n);
+  else if (!strcmp(s, "LAST_32"))        strncpy(out, "ROUND OF 32",   n);
+  else if (!strcmp(s, "LAST_16"))        strncpy(out, "ROUND OF 16",   n);
+  else if (!strcmp(s, "QUARTER_FINALS")) strncpy(out, "QUARTER-FINAL", n);
+  else if (!strcmp(s, "SEMI_FINALS"))    strncpy(out, "SEMI-FINAL",    n);
+  else if (!strcmp(s, "THIRD_PLACE"))    strncpy(out, "3RD PLACE",     n);
+  else if (!strcmp(s, "FINAL"))          strncpy(out, "FINAL",         n);
+  else                                   strncpy(out, "WORLD CUP",     n);
+  out[n - 1] = '\0';
 }
 
 // ----------------------------------------------------------------------------
-//  Drawing
+//  Fonts
+//  Smooth (anti-aliased) Open Sans VLW files live on LittleFS under /fonts.
+//  setUiFont() selects the nearest size for direct-to-TFT text; if the VLW
+//  files aren't present it falls back to the built-in FreeFonts so the UI still
+//  renders. (Header/row sprites keep their own built-in fonts - independent.)
 // ----------------------------------------------------------------------------
-static void drawHeader(int secsToRefresh) {
-  tft.fillRect(0, 0, SCREEN_W, HEADER_H, COL_HEADER);
-  tft.setTextDatum(ML_DATUM);
-  tft.setTextColor(COL_ACCENT, COL_HEADER);
-  tft.setFreeFont(&FreeSansBold12pt7b);
-  tft.drawString("LIVE SCORES", 10, HEADER_H / 2);
+// Selects the nearest Open Sans size on the given target (tft or a sprite).
+// Sprites keep their own font state, so the header sprite must be set too.
+static void setUiFont(TFT_eSPI &g, int px) {
+  if (gSmoothFonts) {
+    g.unloadFont();
+    const char *f = (px >= 30) ? "fonts/OpenSans36"
+                  : (px >= 20) ? "fonts/OpenSans20"
+                               : "fonts/OpenSans16";
+    g.loadFont(f, LittleFS);
+  } else {
+    g.setFreeFont((px >= 30) ? &FreeSansBold24pt7b
+                : (px >= 20) ? &FreeSansBold12pt7b
+                             : &FreeSansBold9pt7b);
+  }
+}
+static void setUiFont(int px) { setUiFont(tft, px); }
 
-  // Clock (from NTP) on the right
-  char clk[6] = "--:--";
-  struct tm t;
-  if (getLocalTime(&t, 5)) snprintf(clk, sizeof(clk), "%02d:%02d", t.tm_hour, t.tm_min);
-  tft.setTextDatum(MR_DATUM);
-  tft.setTextColor(COL_TEXT, COL_HEADER);
-  tft.drawString(clk, SCREEN_W - 12, HEADER_H / 2);
+// ----------------------------------------------------------------------------
+//  Flags  (PNG files on LittleFS, named /flags/<tla>.png, e.g. /flags/rsa.png)
+//
+//  The PNG is decoded into a native-size sprite, then cover-fit + circular-
+//  masked into a round tile. Missing/undecodable files fall back to a lettered
+//  disc, so unknown teams still render cleanly.
+// ----------------------------------------------------------------------------
+// The PNG decoder object reserves ~40KB, so we keep it on the heap and only
+// allocate it while decoding a flag - otherwise it would starve the TLS buffers
+// during a data fetch.
+static PNG         *g_png = nullptr;
+static TFT_eSprite *g_pngTarget = nullptr;   // sprite the decoder writes into
 
-  // Refresh countdown bar
-  int barW = (int)((long)SCREEN_W * (REFRESH_SECONDS - secsToRefresh) / REFRESH_SECONDS);
-  tft.fillRect(0, HEADER_H - 3, SCREEN_W, 3, COL_BG);
-  tft.fillRect(0, HEADER_H - 3, barW, 3, COL_ACCENT);
+// PNGdec line callback: convert each scanline to native RGB565 and write it
+// pixel-by-pixel into the target sprite. Using LITTLE_ENDIAN + drawPixel keeps
+// the colour values native end-to-end (no pushImage byte-swap to get wrong).
+static int pngDraw(PNGDRAW *pDraw) {
+  static uint16_t lineBuf[200];
+  if (!g_png || !g_pngTarget || pDraw->iWidth > 200) return 0;
+  g_png->getLineAsRGB565(pDraw, lineBuf, PNG_RGB565_LITTLE_ENDIAN, 0xffffffff);
+  for (int x = 0; x < pDraw->iWidth; x++)
+    g_pngTarget->drawPixel(x, pDraw->y, lineBuf[x]);
+  return 1;
 }
 
-static void drawMessage(const char *msg, uint16_t colour) {
-  tft.fillRect(0, ROW_TOP, SCREEN_W, SCREEN_H - ROW_TOP, COL_BG);
+// Decode /flags/<key>.png into spr. Returns true and sets w/h on success.
+static bool decodeFlagPng(const char *key, TFT_eSprite &spr, uint16_t &w, uint16_t &h) {
+  char path[40];
+  snprintf(path, sizeof(path), "/flags/%s.png", key);
+  fs::File f = LittleFS.open(path, "r");
+  if (!f) return false;
+  size_t sz = f.size();
+  uint8_t *buf = (uint8_t *)malloc(sz);
+  if (!buf) { f.close(); return false; }
+  f.read(buf, sz);
+  f.close();
+
+  bool ok = false;
+  int  rcOpen = -99, rcDec = -99;
+  bool sprOk = false;
+  g_png = new PNG();
+  if (g_png) {
+    rcOpen = g_png->openRAM(buf, sz, pngDraw);
+    if (rcOpen == PNG_SUCCESS) {
+      w = g_png->getWidth();
+      h = g_png->getHeight();
+      sprOk = (w && h && w <= 200 && spr.createSprite(w, h));
+      if (sprOk) {
+        g_pngTarget = &spr;
+        rcDec = g_png->decode(nullptr, 0);
+        ok = (rcDec == PNG_SUCCESS);
+        g_pngTarget = nullptr;
+      }
+      g_png->close();
+    }
+    delete g_png;
+    g_png = nullptr;
+  }
+  free(buf);
+  Serial.printf("[FLAG] %s sz=%u open=%d w=%u h=%u spr=%d dec=%d -> %s\n",
+                path, (unsigned)sz, rcOpen, w, h, sprOk, rcDec, ok ? "OK" : "FAIL");
+  return ok;
+}
+
+// Circular flag: cx,cy = centre; d = diameter.
+static void drawFlagCircle(int cx, int cy, int d, const char *tla) {
+  int r = d / 2;
+  char key[6] = {0};
+  for (int i = 0; tla[i] && i < 5; i++) key[i] = (char)tolower((unsigned char)tla[i]);
+
+  TFT_eSprite src(&tft);
+  uint16_t sw = 0, sh = 0;
+  bool haveImg = decodeFlagPng(key, src, sw, sh);
+
+  TFT_eSprite dst(&tft);
+  if (!dst.createSprite(d, d)) {            // last-resort direct fallback
+    tft.fillCircle(cx, cy, r, COL_FLAG_BG);
+    if (haveImg) src.deleteSprite();
+    return;
+  }
+  dst.fillSprite(COL_CARD);
+
+  // cover-fit scale so the flag fills the circle
+  float scale = haveImg ? max((float)d / sw, (float)d / sh) : 1.0f;
+  int offX = haveImg ? (int)(sw * scale - d) / 2 : 0;
+  int offY = haveImg ? (int)(sh * scale - d) / 2 : 0;
+
+  for (int y = 0; y < d; y++) {
+    int dy2 = y - r;
+    for (int x = 0; x < d; x++) {
+      int dx2 = x - r;
+      if (dx2 * dx2 + dy2 * dy2 > r * r) continue;   // outside circle
+      uint16_t c = COL_FLAG_BG;
+      if (haveImg) {
+        int sx = (int)((x + offX) / scale), sy = (int)((y + offY) / scale);
+        if (sx < 0) sx = 0; if (sx >= sw) sx = sw - 1;
+        if (sy < 0) sy = 0; if (sy >= sh) sy = sh - 1;
+        c = src.readPixel(sx, sy);
+      }
+      dst.drawPixel(x, y, c);
+    }
+  }
+  dst.pushSprite(cx - r, cy - r, COL_CARD);   // COL_CARD treated as transparent
+  dst.deleteSprite();
+  if (haveImg) src.deleteSprite();
+
+  if (!haveImg) {                              // letter the placeholder disc
+    tft.setTextDatum(MC_DATUM);
+    setUiFont(16);
+    tft.setTextColor(COL_TEXT, COL_FLAG_BG);
+    tft.drawString(tla, cx, cy);
+  }
+  tft.drawCircle(cx, cy, r, COL_CARD_TOP);     // subtle ring
+}
+
+// Five-point outline star (favourite icon, like the demo).
+static void drawStar(int cx, int cy, int rOuter, uint16_t col) {
+  float rInner = rOuter * 0.42f;
+  int px = 0, py = 0;
+  for (int i = 0; i <= 10; i++) {
+    float ang = -HALF_PI + i * (PI / 5.0f);
+    float rr = (i & 1) ? rInner : rOuter;
+    int x = cx + (int)(rr * cosf(ang));
+    int y = cy + (int)(rr * sinf(ang));
+    if (i > 0) tft.drawLine(px, py, x, y, col);
+    px = x; py = y;
+  }
+}
+
+// ----------------------------------------------------------------------------
+//  Drawing (sprite based)
+// ----------------------------------------------------------------------------
+
+// Vertical centre of the score / timer block inside the hero card.
+static const int HERO_SCORE_Y = HERO_Y + 78;
+static const int HERO_TIMER_Y = HERO_Y + 116;
+
+// Draws the red elapsed-time clock (mm:ss since kick-off) under the score.
+// The free tier gives no match minute, so this is wall-clock since kick-off.
+static void drawLiveTimer() {
+  int cx = HERO_X + HERO_W / 2;
+  tft.fillRect(cx - 70, HERO_TIMER_Y - 13, 140, 26, COL_CARD);   // clear
   tft.setTextDatum(MC_DATUM);
-  tft.setFreeFont(&FreeSans12pt7b);
-  tft.setTextColor(colour, COL_BG);
-  tft.drawString(msg, SCREEN_W / 2, (ROW_TOP + SCREEN_H) / 2);
+  setUiFont(20);
+
+  if (!strcmp(heroMatch.status, "PAUSED")) {
+    tft.setTextColor(COL_HT, COL_CARD);
+    tft.drawString("HALF TIME", cx, HERO_TIMER_Y);
+    return;
+  }
+  // Match minute. No live minute from the API, so:
+  //  - 1st half: minutes since kick-off (accurate, no break yet)
+  //  - 2nd half: if we caught the real restart (Option D anchor) -> 45 + time
+  //    since restart (exact); otherwise fall back to (elapsed - 15) estimate.
+  time_t now = time(nullptr);
+  long mins;
+  if (heroMatch.secondHalf) {
+    if (gTrackedId == heroMatch.id && gSecondHalfKO > 0)
+      mins = 45 + (long)((now - gSecondHalfKO) / 60);
+    else
+      mins = (long)((now - heroMatch.koEpoch) / 60) - 15;
+  } else {
+    mins = (long)((now - heroMatch.koEpoch) / 60);
+  }
+  if (mins < 0) mins = 0;
+  char t[10];
+  if      (!heroMatch.secondHalf && mins > 45) snprintf(t, sizeof(t), "45+'");
+  else if ( heroMatch.secondHalf && mins > 90) snprintf(t, sizeof(t), "90+'");
+  else                                         snprintf(t, sizeof(t), "%ld'", mins);
+  tft.setTextColor(COL_LIVE, COL_CARD);
+  tft.drawString(t, cx, HERO_TIMER_Y);
 }
 
-static void drawRow(int idx, const Match &m) {
-  int y  = ROW_TOP + idx * ROW_H;
-  uint16_t rowBg = (idx & 1) ? COL_ROW_ALT : COL_BG;
-  tft.fillRect(0, y, SCREEN_W, ROW_H, rowBg);
+// Featured card matching the demo: breadcrumb, circular flags, full names,
+// big white score, red live timer, faint favourite stars.
+static void drawLiveHero(const Match &m) {
+  bool live = isLive(m);
 
-  int midY = y + ROW_H / 2;
+  // Card background + subtle border
+  tft.fillRoundRect(HERO_X, HERO_Y, HERO_W, HERO_H, 8, COL_CARD);
+  tft.drawRoundRect(HERO_X, HERO_Y, HERO_W, HERO_H, 8, COL_CARD_TOP);
+
+  // Breadcrumb: "World > FIFA World Cup, <round>"
+  char round[20];
+  stageLabel(m, round, sizeof(round));
+  char crumb[64];
+  snprintf(crumb, sizeof(crumb), "World > FIFA World Cup, %s", round);
+  tft.setTextDatum(TL_DATUM);
+  setUiFont(16);
+  tft.setTextColor(COL_BREAD, COL_CARD);
+  tft.drawString(crumb, HERO_X + 14, HERO_Y + 12);
+
+  // Circular flags + favourite stars
+  int d = 70;
+  int fcy = HERO_Y + 70;
+  int hxc = HERO_X + 70;
+  int axc = HERO_X + HERO_W - 70;
+  drawFlagCircle(hxc, fcy, d, m.home);
+  drawFlagCircle(axc, fcy, d, m.away);
+  drawStar(HERO_X + 22, fcy, 9, COL_STAR);
+  drawStar(HERO_X + HERO_W - 22, fcy, 9, COL_STAR);
+
+  // Full team names under the flags
+  tft.setTextDatum(MC_DATUM);
+  setUiFont(16);
+  tft.setTextColor(COL_TEXT, COL_CARD);
+  tft.drawString(m.homeName, hxc, fcy + d / 2 + 18);
+  tft.drawString(m.awayName, axc, fcy + d / 2 + 18);
+
+  // Centre: big white score (or kick-off time for upcoming)
+  int cx = HERO_X + HERO_W / 2;
+  if (matchHasScore(m)) {
+    char sc[12];
+    snprintf(sc, sizeof(sc), "%d - %d", m.homeGoals, m.awayGoals);
+    setUiFont(36);
+    tft.setTextColor(COL_TEXT, COL_CARD);
+    tft.setTextDatum(MC_DATUM);
+    tft.drawString(sc, cx, HERO_SCORE_Y);
+    if (live) drawLiveTimer();
+  } else {
+    setUiFont(36);
+    tft.setTextColor(COL_TEXT, COL_CARD);
+    tft.setTextDatum(MC_DATUM);
+    tft.drawString(m.kickoff, cx, HERO_SCORE_Y);
+    setUiFont(16);
+    tft.setTextColor(COL_SCHED, COL_CARD);
+    tft.drawString("KICK-OFF", cx, HERO_TIMER_Y);
+  }
+}
+
+// WiFi signal as 4 bars; level 0..4 derived from RSSI.
+static void drawWifiBars(TFT_eSprite &s, int x, int y, int level, uint16_t on) {
+  for (int i = 0; i < 4; i++) {
+    int bh = 4 + i * 4;                       // 4,8,12,16 px tall
+    s.fillRect(x + i * 6, y - bh, 4, bh, i < level ? on : COL_HEADER + 0x2104);
+  }
+}
+
+static int wifiLevel() {
+  if (WiFi.status() != WL_CONNECTED) return 0;
+  long r = WiFi.RSSI();
+  if (r >= -55) return 4;
+  if (r >= -65) return 3;
+  if (r >= -72) return 2;
+  if (r >= -82) return 1;
+  return 1;
+}
+
+static void drawHeader(int secsToRefresh) {
+  TFT_eSprite &s = headerSpr;
+  s.fillSprite(COL_HEADER);
+
+  bool connected = (WiFi.status() == WL_CONNECTED);
+  bool online    = connected && gOnline;
+  uint16_t stCol = online ? COL_SCHED : COL_LIVE;
+
+  // Left: WiFi signal bars + ONLINE/OFFLINE (same Open Sans font as the card)
+  drawWifiBars(s, 12, HEADER_H / 2 + 8, wifiLevel(), stCol);
+  setUiFont(s, 16);
+  s.setTextDatum(ML_DATUM);
+  s.setTextColor(stCol, COL_HEADER);
+  s.drawString(online ? "ONLINE" : "OFFLINE", 44, HEADER_H / 2 - 1);
+
+  // Right: "29 Jun | 00:53"
+  char when[20] = "-- --- | --:--";
+  struct tm t;
+  if (getLocalTime(&t, 5)) strftime(when, sizeof(when), "%d %b | %H:%M", &t);
+  s.setTextDatum(MR_DATUM);
+  s.setTextColor(COL_TEXT, COL_HEADER);
+  s.drawString(when, SCREEN_W - 12, HEADER_H / 2 - 1);
+
+  // Refresh countdown bar along the bottom edge
+  if (secsToRefresh < 0) secsToRefresh = 0;
+  int barW = (int)((long)SCREEN_W * (REFRESH_SECONDS - secsToRefresh) / REFRESH_SECONDS);
+  s.fillRect(0, HEADER_H - 3, barW, 3, COL_ACCENT);
+
+  s.pushSprite(0, 0);
+}
+
+static void drawRow(int idx, const Match &m, int screenY) {
+  TFT_eSprite &s = rowSpr;
+  uint16_t rowBg = (idx & 1) ? COL_ROW_ALT : COL_BG;
+  s.fillSprite(rowBg);
+
+  int midY = ROW_H / 2;
 
   // Status badge (left)
   uint16_t badgeCol;
   const char *badge = badgeFor(m, badgeCol);
-  tft.fillRoundRect(8, y + 6, 70, ROW_H - 12, 4, badgeCol);
-  tft.setTextDatum(MC_DATUM);
-  tft.setFreeFont(&FreeSansBold9pt7b);
-  tft.setTextColor(COL_BG, badgeCol);
-  tft.drawString(badge, 8 + 35, midY);
+  s.fillRoundRect(8, 6, 70, ROW_H - 12, 4, badgeCol);
+  s.setTextDatum(MC_DATUM);
+  s.setFreeFont(&FreeSansBold9pt7b);
+  s.setTextColor(COL_BG, badgeCol);
+  s.drawString(badge, 8 + 35, midY);
 
-  // Competition code (small, under nothing - left of names)
-  tft.setTextDatum(ML_DATUM);
-  tft.setTextColor(COL_DIM, rowBg);
-  tft.setFreeFont(&FreeSans9pt7b);
-  tft.drawString(m.comp, 90, midY);
+  // Competition code
+  s.setTextDatum(ML_DATUM);
+  s.setTextColor(COL_DIM, rowBg);
+  s.setFreeFont(&FreeSans9pt7b);
+  s.drawString(m.comp, 90, midY);
 
   // Home team (right aligned toward centre)
-  tft.setFreeFont(&FreeSansBold12pt7b);
-  tft.setTextColor(COL_TEXT, rowBg);
-  tft.setTextDatum(MR_DATUM);
-  tft.drawString(m.home, 230, midY);
+  s.setFreeFont(&FreeSansBold12pt7b);
+  s.setTextColor(COL_TEXT, rowBg);
+  s.setTextDatum(MR_DATUM);
+  s.drawString(m.home, 230, midY);
 
   // Score or "vs" (centre)
   char score[12];
   if (matchHasScore(m)) snprintf(score, sizeof(score), "%d - %d", m.homeGoals, m.awayGoals);
   else                  strcpy(score, "vs");
-  tft.setTextDatum(MC_DATUM);
-  tft.setTextColor(strcmp(m.status, "IN_PLAY") ? COL_TEXT : COL_LIVE, rowBg);
-  tft.drawString(score, 270, midY);
+  s.setTextDatum(MC_DATUM);
+  s.setTextColor(isLive(m) ? COL_LIVE : COL_TEXT, rowBg);
+  s.drawString(score, 270, midY);
 
   // Away team (left aligned from centre)
-  tft.setFreeFont(&FreeSansBold12pt7b);
-  tft.setTextColor(COL_TEXT, rowBg);
-  tft.setTextDatum(ML_DATUM);
-  tft.drawString(m.away, 310, midY);
+  s.setFreeFont(&FreeSansBold12pt7b);
+  s.setTextColor(COL_TEXT, rowBg);
+  s.setTextDatum(ML_DATUM);
+  s.drawString(m.away, 310, midY);
+
+  s.pushSprite(0, screenY);
+}
+
+static void drawMessage(const char *msg, uint16_t colour) {
+  tft.fillRect(0, ROW_TOP, SCREEN_W, SCREEN_H - ROW_TOP, COL_BG);
+  tft.setTextDatum(MC_DATUM);
+  setUiFont(20);
+  tft.setTextColor(colour, COL_BG);
+  tft.drawString(msg, SCREEN_W / 2, (ROW_TOP + SCREEN_H) / 2);
+}
+
+// Watch the hero match's status across polls; capture the second-half kick-off
+// the moment we see PAUSED -> IN_PLAY (Option D). Resets when the match changes.
+static void trackHalfTime(const Match &m) {
+  if (m.id != gTrackedId) {
+    gTrackedId = m.id;
+    gSecondHalfKO = 0;
+    gPrevStatus[0] = '\0';
+  }
+  bool wasPaused = (strcmp(gPrevStatus, "PAUSED") == 0);
+  bool nowLive   = (strcmp(m.status, "IN_PLAY") == 0);
+  if (wasPaused && nowLive && gSecondHalfKO == 0) {
+    gSecondHalfKO = time(nullptr);
+    Serial.printf("[CLOCK] 2nd-half kickoff anchored for match %ld\n", m.id);
+  }
+  strncpy(gPrevStatus, m.status, sizeof(gPrevStatus) - 1);
+  gPrevStatus[sizeof(gPrevStatus) - 1] = '\0';
 }
 
 static void render(int secsToRefresh) {
   drawHeader(secsToRefresh);
+  heroShown = heroIsLive = false;
+
   if (matchCount == 0) {
     drawMessage(statusLine, COL_DIM);
     return;
   }
+
   tft.fillRect(0, ROW_TOP, SCREEN_W, SCREEN_H - ROW_TOP, COL_BG);
-  int rows = min(matchCount, MAX_ROWS);
-  for (int i = 0; i < rows; i++) drawRow(i, matches[i]);
+
+  // Feature the top match (live, else next upcoming) in the hero card.
+  int firstRow = 0;
+  if (isLive(matches[0]) || isUpcoming(matches[0])) {
+    heroMatch  = matches[0];
+    trackHalfTime(matches[0]);
+    drawLiveHero(matches[0]);
+    heroShown  = true;
+    heroIsLive = isLive(matches[0]);
+    firstRow   = 1;
+
+    // Remaining matches as compact rows below the card.
+    int avail = (SCREEN_H - LIST_TOP) / ROW_H;
+    int shown = 0;
+    for (int i = firstRow; i < matchCount && shown < avail; i++, shown++)
+      drawRow(shown, matches[i], LIST_TOP + shown * ROW_H);
+  } else {
+    // No live/upcoming match: plain list from the top.
+    int rows = min(matchCount, MAX_ROWS);
+    for (int i = 0; i < rows; i++) drawRow(i, matches[i], ROW_TOP + i * ROW_H);
+  }
 }
 
 // ----------------------------------------------------------------------------
@@ -196,46 +640,77 @@ static void connectWiFi() {
   strcpy(statusLine, "Connecting to WiFi...");
   render(REFRESH_SECONDS);
 
+  Serial.printf("[WiFi] connecting to %s\n", WIFI_SSID);
   uint32_t start = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - start < 20000) {
-    delay(250);
-  }
+  while (WiFi.status() != WL_CONNECTED && millis() - start < 20000) delay(250);
+
   if (WiFi.status() == WL_CONNECTED) {
-    // Kick off NTP for the on-screen clock / local kickoff math.
-    configTime(0, 0, "pool.ntp.org", "time.nist.gov");  // we apply TZ offset ourselves
-    setenv("TZ", "UTC0", 1);
-    tzset();
-    // Shift system clock to local by configuring the offset directly:
+    Serial.printf("[WiFi] connected, IP %s\n", WiFi.localIP().toString().c_str());
+    // NTP for the on-screen clock and for computing the UTC query date range.
+    // The TZ offset is applied here so getLocalTime() returns local time.
     configTime(TZ_OFFSET_MINUTES * 60, 0, "pool.ntp.org", "time.nist.gov");
+    struct tm t;
+    uint32_t s = millis();
+    while (!getLocalTime(&t, 200) && millis() - s < 8000) delay(200);
+    Serial.printf("[NTP] time %ssynced\n", (time(nullptr) > 1700000000) ? "" : "NOT ");
   } else {
+    Serial.println("[WiFi] FAILED");
     strcpy(statusLine, "WiFi failed - check config.h");
     render(REFRESH_SECONDS);
   }
 }
 
-// Builds the request URL from config.
+// Format a UTC epoch as "YYYY-MM-DD".
+static void fmtDateUTC(time_t when, char *out) {
+  struct tm g;
+  gmtime_r(&when, &g);
+  snprintf(out, 11, "%04d-%02d-%02d", g.tm_year + 1900, g.tm_mon + 1, g.tm_mday);
+}
+
+// Build the request URL. With NTP time we request a date range that starts one
+// day back (in UTC) so live matches that kicked off "yesterday UTC" are caught,
+// through +8 days of upcoming fixtures (free tier allows up to a 10-day window).
+// Without a valid clock we fall back to the default "today" matches endpoint.
 static String buildUrl() {
-  String url = "https://api.football-data.org/v4/matches";
-  if (strlen(COMPETITIONS) > 0) url += String("?competitions=") + COMPETITIONS;
+  String url = "https://api.football-data.org/v4/matches?competitions=";
+  url += (strlen(COMPETITIONS) > 0) ? COMPETITIONS : "WC";
+
+  time_t now = time(nullptr);
+  if (now > 1700000000) {
+    // yesterday (UTC) .. +3 days. Kept short so the decoded JSON body stays
+    // small in RAM; wide enough to show live + recent + next fixtures.
+    char from[11], to[11];
+    fmtDateUTC(now - 86400L,     from);
+    fmtDateUTC(now + 3L * 86400, to);
+    url += "&dateFrom=" + String(from) + "&dateTo=" + String(to);
+  }
   return url;
 }
 
-// Fetch + parse today's matches. Returns true on success.
+// Fetch + parse matches. Returns true on success.
 static bool fetchMatches() {
-  if (WiFi.status() != WL_CONNECTED) { connectWiFi(); if (WiFi.status() != WL_CONNECTED) return false; }
+  if (WiFi.status() != WL_CONNECTED) {
+    connectWiFi();
+    if (WiFi.status() != WL_CONNECTED) { gOnline = false; return false; }
+  }
 
   WiFiClientSecure client;
   client.setInsecure();                 // football-data.org cert not pinned
   HTTPClient https;
   https.setTimeout(12000);
 
-  if (!https.begin(client, buildUrl())) {
+  String url = buildUrl();
+  Serial.printf("[HTTP] GET %s\n", url.c_str());
+  if (!https.begin(client, url)) {
     strcpy(statusLine, "HTTPS begin failed");
+    Serial.println("[HTTP] begin() failed");
     return false;
   }
   https.addHeader("X-Auth-Token", API_TOKEN);
 
   int code = https.GET();
+  Serial.printf("[HTTP] status=%d  contentLength=%d\n", code, https.getSize());
+  gOnline = (code == HTTP_CODE_OK);
   if (code != HTTP_CODE_OK) {
     if (code == 429)      strcpy(statusLine, "Rate limited (10/min) - slow down");
     else if (code == 403) strcpy(statusLine, "403 - competition not in free tier");
@@ -245,56 +720,80 @@ static bool fetchMatches() {
     return false;
   }
 
-  // Only pull the fields we actually render -> keeps RAM use small.
+  // Only pull the fields we render -> keeps RAM use small.
   JsonDocument filter;
-  JsonObject fm = filter["matches"].add<JsonObject>();
-  fm["status"] = true;
-  fm["utcDate"] = true;
-  fm["competition"]["code"] = true;
-  fm["homeTeam"]["tla"] = true;
-  fm["homeTeam"]["shortName"] = true;
-  fm["homeTeam"]["name"] = true;
-  fm["awayTeam"]["tla"] = true;
-  fm["awayTeam"]["shortName"] = true;
-  fm["awayTeam"]["name"] = true;
-  fm["score"]["fullTime"]["home"] = true;
-  fm["score"]["fullTime"]["away"] = true;
+  filter["matches"][0]["id"]                     = true;
+  filter["matches"][0]["status"]                 = true;
+  filter["matches"][0]["utcDate"]                = true;
+  filter["matches"][0]["stage"]                  = true;
+  filter["matches"][0]["group"]                  = true;
+  filter["matches"][0]["competition"]["code"]    = true;
+  filter["matches"][0]["homeTeam"]["tla"]        = true;
+  filter["matches"][0]["homeTeam"]["shortName"]  = true;
+  filter["matches"][0]["homeTeam"]["name"]       = true;
+  filter["matches"][0]["awayTeam"]["tla"]        = true;
+  filter["matches"][0]["awayTeam"]["shortName"]  = true;
+  filter["matches"][0]["awayTeam"]["name"]       = true;
+  filter["matches"][0]["score"]["fullTime"]["home"] = true;
+  filter["matches"][0]["score"]["fullTime"]["away"] = true;
+  filter["matches"][0]["score"]["halfTime"]["home"] = true;
+
+  // The API responds with Transfer-Encoding: chunked (contentLength = -1).
+  // getString() decodes the chunked body; the raw getStream() would leave the
+  // hex chunk-size markers in front of the JSON. Close the connection before
+  // parsing so the TLS buffers are freed first.
+  Serial.printf("[MEM] free heap before read: %u\n", ESP.getFreeHeap());
+  String payload = https.getString();
+  https.end();
+  Serial.printf("[HTTP] body %u bytes\n", payload.length());
 
   JsonDocument doc;
   DeserializationError err =
-      deserializeJson(doc, https.getStream(), DeserializationOption::Filter(filter));
-  https.end();
+      deserializeJson(doc, payload, DeserializationOption::Filter(filter));
 
   if (err) {
     snprintf(statusLine, sizeof(statusLine), "JSON error: %s", err.c_str());
+    Serial.printf("[JSON] %s\n", err.c_str());
     return false;
   }
 
   JsonArrayConst arr = doc["matches"].as<JsonArrayConst>();
   matchCount = 0;
   for (JsonObjectConst mo : arr) {
-    if (matchCount >= MAX_MATCH) break;
+    if (matchCount >= MAX_MATCHES) break;
     Match &m = matches[matchCount];
 
+    m.id = mo["id"] | 0L;
     copyTeamId(mo["homeTeam"], m.home);
     copyTeamId(mo["awayTeam"], m.away);
+    copyTeamName(mo["homeTeam"], m.homeName, sizeof(m.homeName));
+    copyTeamName(mo["awayTeam"], m.awayName, sizeof(m.awayName));
 
     const char *st = mo["status"] | "SCHEDULED";
-    strncpy(m.status, st, sizeof(m.status) - 1);
-    m.status[sizeof(m.status) - 1] = '\0';
+    strncpy(m.status, st, sizeof(m.status) - 1); m.status[sizeof(m.status) - 1] = '\0';
 
     const char *cc = mo["competition"]["code"] | "";
-    strncpy(m.comp, cc, sizeof(m.comp) - 1);
-    m.comp[sizeof(m.comp) - 1] = '\0';
+    strncpy(m.comp, cc, sizeof(m.comp) - 1); m.comp[sizeof(m.comp) - 1] = '\0';
+
+    const char *ud = mo["utcDate"] | "";
+    strncpy(m.utc, ud, sizeof(m.utc) - 1); m.utc[sizeof(m.utc) - 1] = '\0';
+
+    const char *sg = mo["stage"] | "";
+    strncpy(m.stage, sg, sizeof(m.stage) - 1); m.stage[sizeof(m.stage) - 1] = '\0';
+    const char *gp = mo["group"] | "";
+    strncpy(m.group, gp, sizeof(m.group) - 1); m.group[sizeof(m.group) - 1] = '\0';
 
     m.homeGoals = mo["score"]["fullTime"]["home"] | 0;
     m.awayGoals = mo["score"]["fullTime"]["away"] | 0;
-
-    utcToLocal(mo["utcDate"] | "", m.kickoff);
+    m.secondHalf = !mo["score"]["halfTime"]["home"].isNull();
+    utcToLocal(m.utc, m.kickoff);
+    m.koEpoch = isoToEpoch(m.utc);
     matchCount++;
   }
 
-  if (matchCount == 0) strcpy(statusLine, "No matches today");
+  Serial.printf("[PARSE] %d matches\n", matchCount);
+  sortMatches();
+  if (matchCount == 0) strcpy(statusLine, "No matches in range");
   return true;
 }
 
@@ -303,9 +802,38 @@ static bool fetchMatches() {
 // ----------------------------------------------------------------------------
 void setup() {
   Serial.begin(115200);
+  delay(200);
+  Serial.println("\n[BOOT] ESP32 Football Scoreboard");
+
+  Serial.printf("[MEM] PSRAM: %u free / %u total\n",
+                (unsigned)ESP.getFreePsram(), (unsigned)ESP.getPsramSize());
+
   tft.init();
   tft.setRotation(SCREEN_ROTATION);
   tft.fillScreen(COL_BG);
+
+  // LittleFS holds the flag PNGs (uploaded with: pio run -t uploadfs)
+  if (!LittleFS.begin(true)) {
+    Serial.println("[FS] LittleFS mount FAILED");
+  } else {
+    Serial.println("[FS] LittleFS mounted. /flags contents:");
+    fs::File dir = LittleFS.open("/flags");
+    if (dir && dir.isDirectory()) {
+      for (fs::File e = dir.openNextFile(); e; e = dir.openNextFile())
+        Serial.printf("[FS]   %s  (%u bytes)\n", e.name(), (unsigned)e.size());
+    } else {
+      Serial.println("[FS]   (no /flags directory - did you run 'pio run -t uploadfs'?)");
+    }
+    gSmoothFonts = LittleFS.exists("/fonts/OpenSans16.vlw") &&
+                   LittleFS.exists("/fonts/OpenSans20.vlw") &&
+                   LittleFS.exists("/fonts/OpenSans36.vlw");
+    Serial.printf("[FS] smooth fonts: %s\n", gSmoothFonts ? "found" : "MISSING (using FreeFonts)");
+  }
+
+  spritesOK  = headerSpr.createSprite(SCREEN_W, HEADER_H) != nullptr;
+  spritesOK &= rowSpr.createSprite(SCREEN_W, ROW_H) != nullptr;
+  Serial.printf("[SPRITE] alloc %s (free heap %u)\n",
+                spritesOK ? "ok" : "FAILED", ESP.getFreeHeap());
 
   connectWiFi();
   fetchMatches();
@@ -317,17 +845,19 @@ void loop() {
   static uint32_t lastTick  = 0;
   uint32_t now = millis();
 
-  // First fetch happens in setup(); thereafter every REFRESH_SECONDS.
+  // First fetch happened in setup(); thereafter every REFRESH_SECONDS.
   if (now - lastFetch >= (uint32_t)REFRESH_SECONDS * 1000UL) {
     lastFetch = now;
     fetchMatches();
     render(REFRESH_SECONDS);
   }
 
-  // Update header (clock + countdown bar) once per second.
+  // Update header (clock + countdown bar) once per second, and blink the
+  // LIVE dot on the hero card so it reads as "live" without a match minute.
   if (now - lastTick >= 1000) {
     lastTick = now;
     int elapsed = (now - lastFetch) / 1000;
     drawHeader(REFRESH_SECONDS - elapsed);
+    if (heroShown && heroIsLive) drawLiveTimer();
   }
 }
