@@ -32,3 +32,11 @@
 // --- Display ------------------------------------------------------------------
 // 1 = USB port on the left (landscape), 3 = USB on the right (landscape flipped).
 #define SCREEN_ROTATION  1
+
+// --- Touch calibration ---------------------------------------------------------
+// Leave TOUCH_CALIBRATED at 0 for the first flash: the screen will show
+// "Touch corners as indicated" and print 5 values to the Serial Monitor
+// (115200 baud). Copy those into TOUCH_CAL_DATA below, set TOUCH_CALIBRATED
+// to 1, and reflash - the calibration step won't show again.
+#define TOUCH_CALIBRATED  1
+ #define TOUCH_CAL_DATA { 358, 3309, 357, 3007, 7 }

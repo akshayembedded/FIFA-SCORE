@@ -19,17 +19,15 @@
 #include <LittleFS.h>
 #include <PNGdec.h>
 #include <SPI.h>
-#include <XPT2046_Touchscreen.h>
 #include <time.h>
 
 #include "config.h"
 
-// Touch is on hold until the hardware is sorted.
+
 //  TOUCH_ENABLED 0 -> all touch polling is skipped, so there are NO phantom
 //                     page switches and the serial log stays clean.
-//  TOUCH_DEBUG   1 -> stream the raw XPT2046 point (touched/x/y/z) to serial.
-// Set TOUCH_ENABLED to 1 once the touch panel works.
-#define TOUCH_ENABLED 0
+//  TOUCH_DEBUG   1 -> stream the raw TFT_eSPI touch point (touched/x/y) to serial.
+#define TOUCH_ENABLED 1
 #define TOUCH_DEBUG   0
 
 // ----------------------------------------------------------------------------
@@ -66,26 +64,14 @@ TFT_eSprite rowSpr    = TFT_eSprite(&tft);   // 480 x ROW_H, reused per row
 static bool spritesOK = false;
 
 // ----------------------------------------------------------------------------
-//  Touch (XPT2046) on its OWN dedicated HSPI bus, SEPARATE from the display's
-//  VSPI bus. Sharing the display bus gave frozen/garbage readings; a private
-//  bus is the reliable arrangement (per the Bytes N Bits ILI9341 + XPT2046
-//  tutorial / Arduino forum thread).
+//  Touch: TFT_eSPI's built-in XPT2046 support, sharing the display's VSPI bus
+//  (MISO 19, MOSI 23, SCLK 18) plus the dedicated TOUCH_CS pin (14, set in
+//  lib/TFT_eSPI/User_Setup.h). No extra wiring beyond that CS line - T_CLK,
+//  T_DIN and T_DO tie to the same pins as the display.
 //
-//  >>> REWIRE the 4 touch signal pins to these GPIOs (none shared with the
-//      display). T_IRQ does NOT need wiring - we poll over SPI. <<<
-//      T_CLK -> 25,  T_DIN(MOSI) -> 32,  T_DO(MISO) -> 39,  T_CS -> 33
+//  Calibration values are hardcoded in config.h (TOUCH_CAL_DATA) once known -
+//  see setupTouch() below for how to obtain them.
 // ----------------------------------------------------------------------------
-#define T_CLK_PIN  25
-#define T_MOSI_PIN 32
-#define T_MISO_PIN 39
-#define T_CS_PIN   33
-SPIClass            touchSPI(HSPI);
-XPT2046_Touchscreen ts(T_CS_PIN);     // poll mode (no IRQ pin needed)
-
-// Raw-to-screen mapping (tune from TOUCH_DEBUG output). XPT2046 raw values run
-// ~0..4095; these map the usable touch range onto the 480x320 panel.
-static int gTouchMinX = 300, gTouchMaxX = 3800;
-static int gTouchMinY = 300, gTouchMaxY = 3800;
 
 // ----------------------------------------------------------------------------
 //  Match model
@@ -944,16 +930,37 @@ static bool fetchMatches() {
 }
 
 // ----------------------------------------------------------------------------
-//  Touch (XPT2046_Touchscreen on the dedicated HSPI bus). No on-screen
-//  calibration step: raw points are mapped to screen pixels with the gTouch*
-//  constants (tune them from the TOUCH_DEBUG serial output).
+//  Touch (TFT_eSPI built-in driver, via TOUCH_CS in User_Setup.h).
+//
+//  First flash: TOUCH_CALIBRATED is 0 in config.h, so this runs the on-screen
+//  "touch corners" step and prints the resulting 5 values to Serial. Copy
+//  those into TOUCH_CAL_DATA in config.h, set TOUCH_CALIBRATED to 1, reflash -
+//  the calibration step is then skipped on every future boot.
 // ----------------------------------------------------------------------------
 static void setupTouch() {
-  touchSPI.begin(T_CLK_PIN, T_MISO_PIN, T_MOSI_PIN, T_CS_PIN);
-  ts.begin(touchSPI);
-  ts.setRotation(SCREEN_ROTATION);
-  Serial.println("[TOUCH] XPT2046 started on dedicated HSPI bus "
-                 "(CLK25 MISO39 MOSI32 CS33)");
+#if TOUCH_CALIBRATED
+  uint16_t calData[5] = TOUCH_CAL_DATA;
+  tft.setTouch(calData);
+  Serial.println("[TOUCH] using calibration from config.h");
+#else
+  uint16_t calData[5];
+  tft.fillScreen(COL_BG);
+  tft.setTextColor(COL_TEXT, COL_BG);
+  tft.setTextFont(2);
+  tft.setCursor(20, 0);
+  tft.println("Touch corners as indicated");
+  tft.calibrateTouch(calData, TFT_MAGENTA, COL_BG, 15);
+
+  Serial.print("[TOUCH] copy into config.h:  #define TOUCH_CAL_DATA { ");
+  for (uint8_t i = 0; i < 5; i++) {
+    Serial.print(calData[i]);
+    if (i < 4) Serial.print(", ");
+  }
+  Serial.println(" }   then set TOUCH_CALIBRATED to 1");
+
+  tft.setTouch(calData);
+  tft.fillScreen(COL_BG);
+#endif
 }
 
 // Poll the touchscreen; if an arrow button was tapped, switch pages and redraw.
@@ -961,32 +968,30 @@ static void handleTouch() {
 #if !TOUCH_ENABLED
   return;                                   // touch on hold - no polling at all
 #endif
+  uint16_t tx = 0, ty = 0;
 #if TOUCH_DEBUG
   static uint32_t lastDbg = 0;
   if (millis() - lastDbg > 200) {
     lastDbg = millis();
-    bool t = ts.touched();
-    TS_Point p = ts.getPoint();
-    Serial.printf("[TOUCH] touched=%d  x=%4d y=%4d z=%4d\n", t, p.x, p.y, p.z);
+    bool t = tft.getTouch(&tx, &ty);
+    Serial.printf("[TOUCH] touched=%d  x=%4d y=%4d\n", t, tx, ty);
   }
   return;
 #endif
   static bool     down = false;
   static uint32_t lastAct = 0;
-  bool pressed = ts.touched();
+  bool pressed = tft.getTouch(&tx, &ty);
 
   if (pressed && !down && millis() - lastAct > 250) {
     down = true;
-    TS_Point p = ts.getPoint();
-    int sx = map(p.x, gTouchMinX, gTouchMaxX, 0, SCREEN_W);
-    int sy = map(p.y, gTouchMinY, gTouchMaxY, 0, SCREEN_H);
+    int sx = tx, sy = ty;
     if (sy >= FOOTER_Y) {                       // only the footer band navigates
       int prev = gPage;
       if (sx <= NAV_ZONE_W)                 gPage = (gPage + PAGE_COUNT - 1) % PAGE_COUNT;
       else if (sx >= SCREEN_W - NAV_ZONE_W) gPage = (gPage + 1) % PAGE_COUNT;
       if (gPage != prev) {
-        Serial.printf("[NAV] page -> %s (raw %d,%d -> screen %d,%d)\n",
-                      kPageTitle[gPage], p.x, p.y, sx, sy);
+        Serial.printf("[NAV] page -> %s (screen %d,%d)\n",
+                      kPageTitle[gPage], sx, sy);
         render();
         gLastContentSig = contentSignature();   // keep in sync after a page switch
         lastAct = millis();
