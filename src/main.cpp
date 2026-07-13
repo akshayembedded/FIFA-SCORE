@@ -1,8 +1,9 @@
 // =============================================================================
 //  ESP32 Live Football Scoreboard  ->  ILI9488 480x320 TFT (TFT_eSPI)
-//  Data: football-data.org v4 API  (free tier)
+//  Data: local Python scraper/API server (SofaScore -> JSON), see README.md
 //
-//  Edit src/config.h with your WiFi + API token before uploading.
+//  Edit src/config.h with your WiFi + SERVER_HOST (this PC's LAN IP) before
+//  uploading. Both devices must be on the same local network.
 //
 //  Rendering is done with TFT_eSprite (off-screen buffers) for flicker-free
 //  updates. A full 480x320 16bpp sprite would need ~307KB, which won't fit in
@@ -12,7 +13,6 @@
 
 #include <Arduino.h>
 #include <WiFi.h>
-#include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <TFT_eSPI.h>
@@ -77,21 +77,21 @@ static bool spritesOK = false;
 //  Match model
 // ----------------------------------------------------------------------------
 struct Match {
-  long id;          // football-data match id
-  char home[5];     // TLA, e.g. "ARG"
+  long id;           // server match id
+  char home[5];      // short id derived from the team name, e.g. "SOUT"
   char away[5];
-  char homeName[22];// full name, e.g. "South Africa"
-  char awayName[22];
-  time_t koEpoch;   // kick-off as UTC epoch (for the live clock)
-  bool   secondHalf;// half-time score is in -> match is in/after the 2nd half
-  char comp[6];     // competition code
+  char homeName[26]; // full name, e.g. "South Africa"
+  char awayName[26];
+  time_t koEpoch;    // kick-off as UTC epoch (server's startTimestamp, for the live clock)
+  bool   secondHalf; // statusDescription says "2nd half" (or later)
+  char comp[8];      // short round/group label for the compact row, e.g. "GRP A" / "R27"
+  int  round;
   int  homeGoals;
   int  awayGoals;
-  char status[12];  // raw status from API
-  char utc[21];     // full UTC timestamp, used for sorting
-  char kickoff[6];  // "HH:MM" local time
-  char stage[16];   // e.g. GROUP_STAGE, LAST_16
-  char group[10];   // e.g. GROUP_A (may be empty)
+  char status[16];            // "notstarted" / "inprogress" / "finished" / ...
+  char statusDescription[24]; // "2nd half", "Halftime", "Not started", ...
+  char kickoff[6];   // "HH:MM" local time
+  char group[16];    // e.g. "Group A" (may be empty for knockout matches)
 };
 
 static Match matches[MAX_MATCHES];
@@ -105,13 +105,13 @@ static bool  heroShown    = false;  // a hero card is currently on screen
 static bool  heroIsLive   = false;  // that hero is an in-play match
 static Match heroMatch;             // copy of the featured match (for the timer)
 
-// Half-time anchor (Option D): when we observe the live PAUSED -> IN_PLAY
+// Half-time anchor (Option D): when we observe the Halftime -> "2nd half"
 // transition we record the real second-half kick-off, making the 2nd-half
 // minute exact instead of an estimate.
 static long   gTrackedId    = -1;
 static char   gPrevStatus[12] = "";
 static time_t gSecondHalfKO = 0;
-static time_t gLastPausedSeen = 0;  // wall-clock of the most recent PAUSED poll
+static time_t gLastPausedSeen = 0;  // wall-clock of the most recent Halftime poll
 static bool   gAnyLive = false;     // any match in play -> poll faster (see loop)
 
 // ----------------------------------------------------------------------------
@@ -119,12 +119,12 @@ static bool   gAnyLive = false;     // any match in play -> poll faster (see loo
 //  tapping them cycles through the screens. Touch comes from the XPT2046
 //  controller (TOUCH_CS in User_Setup.h), calibrated once and saved to LittleFS.
 // ----------------------------------------------------------------------------
-enum Page { PAGE_FEATURED = 0, PAGE_ALL, PAGE_RESULTS, PAGE_COUNT };
+enum Page { PAGE_FEATURED = 0, PAGE_ALL, PAGE_RESULTS, PAGE_LINEUPS, PAGE_COUNT };
 static int gPage = PAGE_FEATURED;
 static uint32_t gLastContentSig = 0;   // last painted content hash (see loop)
 static int  gRenderedPage = -1;        // page currently on screen
 static long gHeroDrawnId  = -1;        // id of the match whose card is on screen
-static const char *kPageTitle[PAGE_COUNT] = { "FEATURED", "ALL MATCHES", "RESULTS" };
+static const char *kPageTitle[PAGE_COUNT] = { "FEATURED", "ALL MATCHES", "RESULTS", "LINE-UPS" };
 
 static const int FOOTER_H    = 40;
 static const int FOOTER_Y    = SCREEN_H - FOOTER_H;    // 280
@@ -142,61 +142,119 @@ static const int HERO_W = SCREEN_W - 12;
 //  Helpers
 // ----------------------------------------------------------------------------
 
-// Copy a short team identifier into dst (max 4 chars). Prefers TLA, then a
-// trimmed shortName/name fallback.
-static void copyTeamId(JsonObjectConst team, char *dst) {
-  const char *tla       = team["tla"]       | "";
-  const char *shortName = team["shortName"] | "";
-  const char *name      = team["name"]      | "";
-  const char *src = tla[0] ? tla : (shortName[0] ? shortName : name);
+struct TeamCode { const char *name; const char *code; };
+
+// Known team-name -> FIFA-style 3-letter code. The server sends full names
+// ("South Africa") rather than codes, but the flag PNGs on LittleFS are named
+// by code (data/flags/rsa.png) - so this table drives both the compact row
+// label and the flag lookup key. Add an entry here whenever you add a new
+// flag file; unmatched names fall back to a truncated name below, which is
+// fine for the row label but won't find a flag (falls back to the lettered
+// placeholder disc).
+static const TeamCode kTeamCodes[] = {
+  { "Brazil",        "BRA" },
+  { "Canada",        "CAN" },
+  { "England",       "ENG" },
+  { "Japan",         "JPN" },
+  { "Mexico",        "MEX" },
+  { "Norway",        "NOR" },
+  { "Portugal",      "POR" },
+  { "South Africa",  "RSA" },
+  { "Argentina",     "ARG" },
+  { "France",        "FRA" },
+  { "Germany",       "GER" },
+  { "Spain",         "ESP" },
+  { "Italy",         "ITA" },
+  { "Netherlands",   "NED" },
+  { "Belgium",       "BEL" },
+  { "Croatia",       "CRO" },
+  { "Uruguay",       "URU" },
+  { "Colombia",      "COL" },
+  { "Ecuador",       "ECU" },
+  { "Peru",          "PER" },
+  { "Chile",         "CHI" },
+  { "Paraguay",      "PAR" },
+  { "United States", "USA" },
+  { "USA",           "USA" },
+  { "Panama",        "PAN" },
+  { "Costa Rica",    "CRC" },
+  { "South Korea",   "KOR" },
+  { "Australia",     "AUS" },
+  { "Iran",          "IRN" },
+  { "Saudi Arabia",  "KSA" },
+  { "Qatar",         "QAT" },
+  { "Morocco",       "MAR" },
+  { "Algeria",       "ALG" },
+  { "Tunisia",       "TUN" },
+  { "Egypt",         "EGY" },
+  { "Senegal",       "SEN" },
+  { "Nigeria",       "NGA" },
+  { "Ghana",         "GHA" },
+  { "Cameroon",      "CMR" },
+  { "Ivory Coast",   "CIV" },
+  { "Switzerland",   "SUI" },
+  { "Poland",        "POL" },
+  { "Serbia",        "SRB" },
+  { "Denmark",       "DEN" },
+  { "Sweden",        "SWE" },
+  { "Wales",         "WAL" },
+  { "Scotland",      "SCO" },
+};
+static const int kTeamCodeCount = sizeof(kTeamCodes) / sizeof(kTeamCodes[0]);
+
+static bool equalsCI(const char *a, const char *b) {
+  while (*a && *b) {
+    if (tolower((unsigned char)*a) != tolower((unsigned char)*b)) return false;
+    a++; b++;
+  }
+  return *a == *b;
+}
+
+// Derive a short (max 4 char) row-display id from a full team name: a known
+// FIFA-style code if we have one (also doubles as the /flags/<code>.png key),
+// otherwise a truncated fallback so the row still shows something.
+static void makeShortId(const char *name, char *dst) {
+  for (int i = 0; i < kTeamCodeCount; i++) {
+    if (equalsCI(name, kTeamCodes[i].name)) { strcpy(dst, kTeamCodes[i].code); return; }
+  }
   int i = 0;
-  for (; src[i] && i < 4; i++) dst[i] = (char)toupper((unsigned char)src[i]);
+  for (; name[i] && i < 4; i++) dst[i] = (char)toupper((unsigned char)name[i]);
   dst[i] = '\0';
   if (!dst[0]) strcpy(dst, "???");
 }
 
-// Copy a readable team name (prefers shortName, then full name) into dst.
-static void copyTeamName(JsonObjectConst team, char *dst, size_t n) {
-  const char *shortName = team["shortName"] | "";
-  const char *name      = team["name"]      | "";
-  const char *src = shortName[0] ? shortName : name;
-  strncpy(dst, src, n - 1);
-  dst[n - 1] = '\0';
+// Case-insensitive substring search (statusDescription text varies in case).
+static bool containsCI(const char *hay, const char *needle) {
+  size_t hl = strlen(hay), nl = strlen(needle);
+  if (!nl || nl > hl) return false;
+  for (size_t i = 0; i + nl <= hl; i++) {
+    size_t j = 0;
+    for (; j < nl; j++)
+      if (tolower((unsigned char)hay[i + j]) != tolower((unsigned char)needle[j])) break;
+    if (j == nl) return true;
+  }
+  return false;
 }
 
-// Days since 1970-01-01 for a civil date (Howard Hinnant's algorithm).
-static long daysFromCivil(int y, unsigned m, unsigned d) {
-  y -= m <= 2;
-  long era = (y >= 0 ? y : y - 399) / 400;
-  unsigned yoe = (unsigned)(y - era * 400);
-  unsigned doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
-  unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-  return era * 146097L + (long)doe - 719468;
-}
-
-// Parse a UTC ISO timestamp ("2026-06-29T18:00:00Z") to a UTC epoch.
-static time_t isoToEpoch(const char *s) {
-  if (!s || strlen(s) < 19) return 0;
-  int Y = atoi(s), M = atoi(s + 5), D = atoi(s + 8);
-  int h = atoi(s + 11), mi = atoi(s + 14), se = atoi(s + 17);
-  return (time_t)(daysFromCivil(Y, M, D) * 86400L + h * 3600 + mi * 60 + se);
-}
-
-// Convert a UTC ISO timestamp ("2026-06-29T18:00:00Z") to local "HH:MM".
-static void utcToLocal(const char *utc, char *out) {
-  if (!utc || strlen(utc) < 16) { strcpy(out, "--:--"); return; }
-  int h = (utc[11] - '0') * 10 + (utc[12] - '0');
-  int m = (utc[14] - '0') * 10 + (utc[15] - '0');
-  int total = h * 60 + m + TZ_OFFSET_MINUTES;
+// Convert a UTC epoch (server's startTimestamp) to local "HH:MM".
+static void epochToLocal(time_t ts, char *out) {
+  struct tm g;
+  gmtime_r(&ts, &g);
+  int total = g.tm_hour * 60 + g.tm_min + TZ_OFFSET_MINUTES;
   total = ((total % 1440) + 1440) % 1440;
   snprintf(out, 6, "%02d:%02d", total / 60, total % 60);
 }
 
+// Halftime is reported as status "inprogress" with a "Halftime" description,
+// not a separate status value.
+static bool isHalftime(const Match &m) {
+  return containsCI(m.statusDescription, "halftime") || containsCI(m.statusDescription, "half time");
+}
 static bool isLive(const Match &m) {
-  return !strcmp(m.status, "IN_PLAY") || !strcmp(m.status, "PAUSED");
+  return !strcmp(m.status, "inprogress");
 }
 static bool isUpcoming(const Match &m) {
-  return !strcmp(m.status, "TIMED") || !strcmp(m.status, "SCHEDULED");
+  return !strcmp(m.status, "notstarted");
 }
 
 // Sort priority: live (0) -> upcoming (1) -> finished/other (2).
@@ -216,9 +274,9 @@ static void sortMatches() {
       if (ra != rb) {
         swap = ra > rb;
       } else if (ra == 2) {
-        swap = strcmp(a.utc, b.utc) < 0;   // finished: newest first
+        swap = a.koEpoch < b.koEpoch;   // finished: newest first
       } else {
-        swap = strcmp(a.utc, b.utc) > 0;   // live/upcoming: earliest first
+        swap = a.koEpoch > b.koEpoch;   // live/upcoming: earliest first
       }
       if (swap) { Match t = a; a = b; b = t; }
     }
@@ -227,56 +285,92 @@ static void sortMatches() {
 
 // Returns a short status badge ("LIVE", "HT", "FT", or kickoff time) + colour.
 static const char *badgeFor(const Match &m, uint16_t &colour) {
-  if (!strcmp(m.status, "IN_PLAY"))   { colour = COL_LIVE;  return "LIVE"; }
-  if (!strcmp(m.status, "PAUSED"))    { colour = COL_HT;    return "HT";   }
-  if (!strcmp(m.status, "FINISHED"))  { colour = COL_FT;    return "FT";   }
-  if (!strcmp(m.status, "POSTPONED")) { colour = COL_DIM;   return "PP";   }
-  if (!strcmp(m.status, "SUSPENDED")) { colour = COL_DIM;   return "SUSP"; }
-  if (!strcmp(m.status, "CANCELLED")) { colour = COL_DIM;   return "CANC"; }
-  colour = COL_SCHED;                   // TIMED / SCHEDULED
+  if (!strcmp(m.status, "inprogress")) {
+    if (isHalftime(m)) { colour = COL_HT; return "HT"; }
+    colour = COL_LIVE; return "LIVE";
+  }
+  if (!strcmp(m.status, "finished"))                                        { colour = COL_FT;  return "FT";   }
+  if (!strcmp(m.status, "postponed"))                                       { colour = COL_DIM; return "PP";   }
+  if (!strcmp(m.status, "suspended") || !strcmp(m.status, "interrupted"))   { colour = COL_DIM; return "SUSP"; }
+  if (!strcmp(m.status, "canceled")  || !strcmp(m.status, "cancelled"))    { colour = COL_DIM; return "CANC"; }
+  colour = COL_SCHED;                   // notstarted
   return m.kickoff;
 }
 
 static bool matchHasScore(const Match &m) {
-  return !isUpcoming(m) && strcmp(m.status, "POSTPONED") && strcmp(m.status, "CANCELLED");
+  return !isUpcoming(m) && strcmp(m.status, "postponed")
+      && strcmp(m.status, "canceled") && strcmp(m.status, "cancelled");
 }
 
-// Build a human label for the round/group, e.g. "GROUP B" or "ROUND OF 16".
+// Knockout-round number -> name, from this competition's GET /rounds (group
+// stage rounds 1-3 aren't listed there since those matches carry a `group`
+// instead - see stageLabel()). The round numbers are this server's own
+// numbering, not sequential by stage order, so this only covers what /rounds
+// actually reported - re-check it if the server switches competitions.
+struct RoundName { int round; const char *label; const char *shortLabel; };
+static const RoundName kRoundNames[] = {
+  { 6,  "ROUND OF 32",   "R32" },
+  { 5,  "ROUND OF 16",   "R16" },
+  { 27, "QUARTERFINALS", "QF"  },
+  { 28, "SEMIFINALS",    "SF"  },
+  { 50, "3RD PLACE",     "3RD" },
+  { 29, "FINAL",         "FIN" },
+};
+static const RoundName *findRoundName(int round) {
+  for (const RoundName &r : kRoundNames) if (r.round == round) return &r;
+  return nullptr;
+}
+
+// Build a human label for the round/group, e.g. "GROUP B" or "QUARTERFINALS".
 static void stageLabel(const Match &m, char *out, size_t n) {
-  if (m.group[0]) {                       // "GROUP_A" -> "GROUP A"
-    size_t i = 0;
-    for (; m.group[i] && i < n - 1; i++) out[i] = (m.group[i] == '_') ? ' ' : m.group[i];
-    out[i] = '\0';
+  if (m.group[0]) {
+    strncpy(out, m.group, n - 1);
+    out[n - 1] = '\0';
+    for (char *p = out; *p; p++) *p = (char)toupper((unsigned char)*p);
     return;
   }
-  const char *s = m.stage;
-  if      (!strcmp(s, "GROUP_STAGE"))    strncpy(out, "GROUP STAGE",   n);
-  else if (!strcmp(s, "LAST_32"))        strncpy(out, "ROUND OF 32",   n);
-  else if (!strcmp(s, "LAST_16"))        strncpy(out, "ROUND OF 16",   n);
-  else if (!strcmp(s, "QUARTER_FINALS")) strncpy(out, "QUARTER-FINAL", n);
-  else if (!strcmp(s, "SEMI_FINALS"))    strncpy(out, "SEMI-FINAL",    n);
-  else if (!strcmp(s, "THIRD_PLACE"))    strncpy(out, "3RD PLACE",     n);
-  else if (!strcmp(s, "FINAL"))          strncpy(out, "FINAL",         n);
-  else                                   strncpy(out, "WORLD CUP",     n);
+  const RoundName *r = findRoundName(m.round);
+  if (r) strncpy(out, r->label, n - 1);
+  else   snprintf(out, n, "ROUND %d", m.round);
   out[n - 1] = '\0';
 }
 
 // ----------------------------------------------------------------------------
 //  Fonts
 //  Smooth (anti-aliased) Open Sans VLW files live on LittleFS under /fonts.
-//  setUiFont() selects the nearest size for direct-to-TFT text; if the VLW
-//  files aren't present it falls back to the built-in FreeFonts so the UI still
-//  renders. (Header/row sprites keep their own built-in fonts - independent.)
+//  setUiFont() selects the nearest size for direct-to-TFT text or a sprite; if
+//  the VLW files aren't present it falls back to the built-in FreeFonts so the
+//  UI still renders. Used everywhere text is drawn, including header and row
+//  sprites, so all pages share the same font.
 // ----------------------------------------------------------------------------
 // Selects the nearest Open Sans size on the given target (tft or a sprite).
 // Sprites keep their own font state, so the header sprite must be set too.
+//
+// loadFont() re-reads the whole glyph/Unicode index table from LittleFS, so
+// calling it every time (a row draws badge/comp/home/away -> 3-4 calls each)
+// made rows visibly paint one at a time. tft/headerSpr/rowSpr are the only
+// targets ever passed in, so a tiny fixed-size cache of (target, last size)
+// is enough to skip the reload whenever the size hasn't actually changed.
 static void setUiFont(TFT_eSPI &g, int px) {
   if (gSmoothFonts) {
+    static const TFT_eSPI *lastTarget[3] = { nullptr, nullptr, nullptr };
+    static int             lastPx[3]     = { -1, -1, -1 };
+
+    int slot = -1, freeSlot = -1;
+    for (int i = 0; i < 3; i++) {
+      if (lastTarget[i] == &g) { slot = i; break; }
+      if (lastTarget[i] == nullptr && freeSlot < 0) freeSlot = i;
+    }
+    if (slot >= 0 && lastPx[slot] == px) return;   // already loaded - skip reload
+    if (slot < 0) slot = freeSlot;
+
     g.unloadFont();
     const char *f = (px >= 30) ? "fonts/OpenSans36"
                   : (px >= 20) ? "fonts/OpenSans20"
                                : "fonts/OpenSans16";
     g.loadFont(f, LittleFS);
+
+    if (slot >= 0) { lastTarget[slot] = &g; lastPx[slot] = px; }
   } else {
     g.setFreeFont((px >= 30) ? &FreeSansBold24pt7b
                 : (px >= 20) ? &FreeSansBold12pt7b
@@ -410,7 +504,7 @@ static const int HERO_SCORE_Y = HERO_Y + 78;
 static const int HERO_TIMER_Y = HERO_Y + 116;
 
 // Draws the red elapsed-time clock (mm:ss since kick-off) under the score.
-// The free tier gives no match minute, so this is wall-clock since kick-off.
+// The server doesn't expose a live match minute, so this is wall-clock since kick-off.
 static void drawLiveTimer(bool force = false) {
   int cx = HERO_X + HERO_W / 2;
 
@@ -418,13 +512,13 @@ static void drawLiveTimer(bool force = false) {
   // changed (otherwise "HALF TIME" / the minute would flicker every second).
   char t[12];
   uint16_t col;
-  if (!strcmp(heroMatch.status, "PAUSED")) {
+  if (isHalftime(heroMatch)) {
     strcpy(t, "HALF TIME");
     col = COL_HT;
   } else if (heroMatch.secondHalf &&
              !(gTrackedId == heroMatch.id && gSecondHalfKO > 0)) {
     // 2nd half, but we never saw the restart (e.g. the board was switched on
-    // mid-half). The free API gives no live minute, and "elapsed - 15" would
+    // mid-half). The server gives no live minute, and "elapsed - 15" would
     // over-count by first-half stoppage + the real break length - that's how
     // 57' ends up shown as 64'. Print an honest label instead of a fake number.
     strcpy(t, "2ND HALF");
@@ -577,18 +671,18 @@ static void drawRow(int idx, const Match &m, int screenY) {
   const char *badge = badgeFor(m, badgeCol);
   s.fillRoundRect(8, 6, 70, ROW_H - 12, 4, badgeCol);
   s.setTextDatum(MC_DATUM);
-  s.setFreeFont(&FreeSansBold9pt7b);
+  setUiFont(s, 16);
   s.setTextColor(COL_BG, badgeCol);
   s.drawString(badge, 8 + 35, midY);
 
   // Competition code
   s.setTextDatum(ML_DATUM);
   s.setTextColor(COL_DIM, rowBg);
-  s.setFreeFont(&FreeSans9pt7b);
+  setUiFont(s, 16);
   s.drawString(m.comp, 90, midY);
 
   // Home team (right aligned toward centre)
-  s.setFreeFont(&FreeSansBold12pt7b);
+  setUiFont(s, 20);
   s.setTextColor(COL_TEXT, rowBg);
   s.setTextDatum(MR_DATUM);
   s.drawString(m.home, 230, midY);
@@ -602,7 +696,7 @@ static void drawRow(int idx, const Match &m, int screenY) {
   s.drawString(score, 270, midY);
 
   // Away team (left aligned from centre)
-  s.setFreeFont(&FreeSansBold12pt7b);
+  setUiFont(s, 20);
   s.setTextColor(COL_TEXT, rowBg);
   s.setTextDatum(ML_DATUM);
   s.drawString(m.away, 310, midY);
@@ -619,7 +713,7 @@ static void drawMessage(const char *msg, uint16_t colour) {
 }
 
 // Watch the hero match's status across polls; capture the second-half kick-off
-// the moment we see PAUSED -> IN_PLAY (Option D). Resets when the match changes.
+// the moment we see Halftime -> "2nd half" (Option D). Resets when the match changes.
 static void trackHalfTime(const Match &m) {
   if (m.id != gTrackedId) {
     gTrackedId      = m.id;
@@ -628,19 +722,18 @@ static void trackHalfTime(const Match &m) {
     gPrevStatus[0]  = '\0';
   }
   time_t now = time(nullptr);
-  if (!strcmp(m.status, "PAUSED")) gLastPausedSeen = now;   // refresh each break poll
+  bool paused = isHalftime(m);
+  if (paused) gLastPausedSeen = now;   // refresh each break poll
 
-  bool wasPaused = (strcmp(gPrevStatus, "PAUSED") == 0);
-  bool nowLive   = (strcmp(m.status, "IN_PLAY") == 0);
-  if (wasPaused && nowLive && gSecondHalfKO == 0) {
+  bool wasPaused = (strcmp(gPrevStatus, "HT") == 0);
+  if (wasPaused && m.secondHalf && gSecondHalfKO == 0) {
     // The real restart happened somewhere between the last poll that still saw
-    // PAUSED and this one. Anchor to the midpoint of that window so the clock is
+    // Halftime and this one. Anchor to the midpoint of that window so the clock is
     // off by at most half a poll interval, instead of trailing the whole one.
     gSecondHalfKO = (gLastPausedSeen > 0) ? (gLastPausedSeen + now) / 2 : now;
     Serial.printf("[CLOCK] 2nd-half kickoff anchored for match %ld\n", m.id);
   }
-  strncpy(gPrevStatus, m.status, sizeof(gPrevStatus) - 1);
-  gPrevStatus[sizeof(gPrevStatus) - 1] = '\0';
+  strcpy(gPrevStatus, paused ? "HT" : "");
 }
 
 // ----------------------------------------------------------------------------
@@ -685,7 +778,7 @@ static void drawFooter() {
 //  Page bodies
 // ----------------------------------------------------------------------------
 static bool predAll(const Match &m)      { (void)m; return true; }
-static bool predFinished(const Match &m) { return !strcmp(m.status, "FINISHED"); }
+static bool predFinished(const Match &m) { return !strcmp(m.status, "finished"); }
 
 // Generic list page: draws matches passing pred() as compact rows.
 static void drawListPage(bool (*pred)(const Match &), const char *emptyMsg) {
@@ -717,6 +810,146 @@ static void drawFeatured() {
   heroIsLive = isLive(matches[0]);
 }
 
+// ----------------------------------------------------------------------------
+//  Line-ups page: starting XI + formation for both teams in the featured
+//  match, fetched from GET /match/{id}/lineups on the local server.
+// ----------------------------------------------------------------------------
+struct LineupPlayer {
+  char name[23];
+  char pos;     // 'G' / 'D' / 'M' / 'F'
+  int  jersey;
+};
+struct TeamLineup {
+  char formation[8];
+  char teamName[26];
+  LineupPlayer starters[11];
+  int  count;
+};
+static TeamLineup gHomeLineup, gAwayLineup;
+static long gLineupMatchId = -1;   // id whose lineups are currently loaded
+static bool gLineupOk      = false;
+
+// Starting XI only (substitute == false) - subs don't fit the compact layout.
+static void parseLineupTeam(JsonObjectConst teamObj, TeamLineup &out, const char *teamName) {
+  const char *f = teamObj["formation"] | "";
+  strncpy(out.formation, f, sizeof(out.formation) - 1); out.formation[sizeof(out.formation) - 1] = '\0';
+  strncpy(out.teamName, teamName, sizeof(out.teamName) - 1); out.teamName[sizeof(out.teamName) - 1] = '\0';
+
+  out.count = 0;
+  for (JsonObjectConst p : teamObj["players"].as<JsonArrayConst>()) {
+    if (out.count >= 11) break;
+    if (p["substitute"] | true) continue;   // skip subs, missing flag treated as sub
+
+    LineupPlayer &lp = out.starters[out.count];
+    const char *nm = p["name"] | "";
+    strncpy(lp.name, nm, sizeof(lp.name) - 1); lp.name[sizeof(lp.name) - 1] = '\0';
+    const char *pos = p["position"] | "";
+    lp.pos = pos[0] ? pos[0] : '?';
+    lp.jersey = atoi(p["jerseyNumber"] | "0");
+    out.count++;
+  }
+}
+
+// Fetch + parse the lineups for one match. Returns true if at least one side
+// came back with starters (some matches have no confirmed lineup yet).
+static bool fetchLineups(long matchId) {
+  if (WiFi.status() != WL_CONNECTED) return false;
+
+  WiFiClient client;
+  HTTPClient http;
+  http.setTimeout(12000);
+
+  String url = "http://" + String(SERVER_HOST) + ":" + String(SERVER_PORT) +
+               "/match/" + String(matchId) + "/lineups";
+  Serial.printf("[HTTP] GET %s\n", url.c_str());
+
+  gLineupMatchId = matchId;
+  gLineupOk = false;
+  if (!http.begin(client, url)) return false;
+
+  int code = http.GET();
+  Serial.printf("[LINEUP] status=%d\n", code);
+  if (code != HTTP_CODE_OK) { http.end(); return false; }
+
+  JsonDocument filter;
+  filter["home"]["formation"]                  = true;
+  filter["home"]["players"][0]["name"]         = true;
+  filter["home"]["players"][0]["position"]     = true;
+  filter["home"]["players"][0]["jerseyNumber"] = true;
+  filter["home"]["players"][0]["substitute"]   = true;
+  filter["away"]["formation"]                  = true;
+  filter["away"]["players"][0]["name"]         = true;
+  filter["away"]["players"][0]["position"]     = true;
+  filter["away"]["players"][0]["jerseyNumber"] = true;
+  filter["away"]["players"][0]["substitute"]   = true;
+
+  String payload = http.getString();
+  http.end();
+
+  JsonDocument doc;
+  DeserializationError err =
+      deserializeJson(doc, payload, DeserializationOption::Filter(filter));
+  if (err) {
+    Serial.printf("[LINEUP] JSON error: %s\n", err.c_str());
+    return false;
+  }
+
+  parseLineupTeam(doc["home"], gHomeLineup, matches[0].homeName);
+  parseLineupTeam(doc["away"], gAwayLineup, matches[0].awayName);
+  gLineupOk = (gHomeLineup.count > 0 || gAwayLineup.count > 0);
+  return gLineupOk;
+}
+
+// Two columns (home | away), each: team name + formation header, then the
+// starting XI as jersey number + name, colour-coded by position.
+static void drawLineups() {
+  tft.fillRect(0, CONTENT_TOP, SCREEN_W, CONTENT_H, COL_BG);
+
+  const Match &featured = matches[0];
+  if (gLineupMatchId != featured.id) fetchLineups(featured.id);   // blocking, once per match
+
+  if (!gLineupOk) { drawMessage("Lineups unavailable", COL_DIM); return; }
+
+  int midX = SCREEN_W / 2;
+  tft.drawFastVLine(midX, CONTENT_TOP, CONTENT_H, COL_CARD_TOP);
+
+  const int headerH = 20;
+  int rowH = (CONTENT_H - headerH) / 11;
+
+  const TeamLineup *teams[2] = { &gHomeLineup, &gAwayLineup };
+  int colX[2] = { 4, midX + 4 };
+
+  for (int c = 0; c < 2; c++) {
+    const TeamLineup &t = *teams[c];
+
+    char hdr[36];
+    snprintf(hdr, sizeof(hdr), "%s (%s)", t.teamName, t.formation);
+    tft.setTextDatum(TL_DATUM);
+    setUiFont(16);
+    tft.setTextColor(COL_ACCENT, COL_BG);
+    tft.drawString(hdr, colX[c] + 4, CONTENT_TOP + 2);
+
+    for (int i = 0; i < t.count; i++) {
+      const LineupPlayer &p = t.starters[i];
+      int y = CONTENT_TOP + headerH + i * rowH + rowH / 2;
+      uint16_t posCol = (p.pos == 'G') ? COL_HT
+                       : (p.pos == 'D') ? COL_ACCENT
+                       : (p.pos == 'M') ? COL_SCHED
+                                        : COL_LIVE;   // 'F' and anything else
+
+      char num[4];
+      snprintf(num, sizeof(num), "%d", p.jersey);
+      tft.setTextDatum(ML_DATUM);
+      setUiFont(16);
+      tft.setTextColor(posCol, COL_BG);
+      tft.drawString(num, colX[c] + 4, y);
+
+      tft.setTextColor(COL_TEXT, COL_BG);
+      tft.drawString(p.name, colX[c] + 30, y);
+    }
+  }
+}
+
 // A cheap hash of everything that affects the on-screen content. The loop only
 // repaints the screen when this changes, so a fetch that returns identical data
 // no longer triggers a jarring full-screen redraw.
@@ -743,6 +976,8 @@ static void render() {
     gHeroDrawnId = -1;                  // force a fresh card when matches return
   } else if (gPage == PAGE_FEATURED) {
     drawFeatured();        // clears the band itself, only when the card changes
+  } else if (gPage == PAGE_LINEUPS) {
+    drawLineups();          // clears the band itself
   } else {
     // List pages: clear and redraw the rows (cheap, no flag decode).
     tft.fillRect(0, CONTENT_TOP, SCREEN_W, CONTENT_H, COL_BG);
@@ -769,7 +1004,7 @@ static void connectWiFi() {
 
   if (WiFi.status() == WL_CONNECTED) {
     Serial.printf("[WiFi] connected, IP %s\n", WiFi.localIP().toString().c_str());
-    // NTP for the on-screen clock and for computing the UTC query date range.
+    // NTP for the on-screen clock and for computing the live match minute.
     // The TZ offset is applied here so getLocalTime() returns local time.
     configTime(TZ_OFFSET_MINUTES * 60, 0, "pool.ntp.org", "time.nist.gov");
     struct tm t;
@@ -783,91 +1018,117 @@ static void connectWiFi() {
   }
 }
 
-// Format a UTC epoch as "YYYY-MM-DD".
-static void fmtDateUTC(time_t when, char *out) {
-  struct tm g;
-  gmtime_r(&when, &g);
-  snprintf(out, 11, "%04d-%02d-%02d", g.tm_year + 1900, g.tm_mon + 1, g.tm_mday);
+// GET /rounds -> the tournament's current round number, plus the next round
+// in tournament order. /today only shows matches dated today, which is empty
+// on knockout rest days - /fixtures?round=<current> instead returns that
+// whole round regardless of date. But the server's "current" pointer can lag
+// behind results (e.g. it stays on Quarterfinals even after all 4 QF matches
+// finish, until Semifinals actually kicks off), so Results/All would show
+// only finished matches with nothing upcoming. Pulling gNextRound too - the
+// entry right after "current" in the "rounds" array's tournament order (NOT
+// sorted by round number, since e.g. Round of 16 = round 5 comes after Round
+// of 32 = round 6) - fills that gap. Best-effort: keeps the last known round
+// on failure rather than blanking the display.
+static int gCurrentRound = -1;
+static int gNextRound    = -1;
+
+static bool fetchCurrentRound() {
+  if (WiFi.status() != WL_CONNECTED) return false;
+
+  WiFiClient client;
+  HTTPClient http;
+  http.setTimeout(8000);
+
+  String url = "http://" + String(SERVER_HOST) + ":" + String(SERVER_PORT) + "/rounds";
+  if (!http.begin(client, url)) return false;
+
+  int code = http.GET();
+  if (code != HTTP_CODE_OK) { http.end(); return false; }
+
+  JsonDocument filter;
+  filter["current"]["round"]  = true;
+  filter["rounds"][0]["round"] = true;
+
+  String payload = http.getString();
+  http.end();
+
+  JsonDocument doc;
+  if (deserializeJson(doc, payload, DeserializationOption::Filter(filter))) return false;
+
+  int cur = doc["current"]["round"] | -1;
+  if (cur <= 0) return false;
+  gCurrentRound = cur;
+
+  gNextRound = -1;
+  bool foundCurrent = false;
+  for (JsonObjectConst ro : doc["rounds"].as<JsonArrayConst>()) {
+    int rr = ro["round"] | -1;
+    if (foundCurrent) { gNextRound = rr; break; }
+    if (rr == gCurrentRound) foundCurrent = true;
+  }
+  return true;
 }
 
-// Build the request URL. With NTP time we request a date range that starts one
-// day back (in UTC) so live matches that kicked off "yesterday UTC" are caught,
-// through +8 days of upcoming fixtures (free tier allows up to a 10-day window).
-// Without a valid clock we fall back to the default "today" matches endpoint.
+// Build the request URL for the local server (plain HTTP, no auth needed -
+// it's only reachable on the local network). Uses the current round's full
+// fixture list once known; falls back to /today until the first successful
+// /rounds lookup.
 static String buildUrl() {
-  String url = "https://api.football-data.org/v4/matches?competitions=";
-  url += (strlen(COMPETITIONS) > 0) ? COMPETITIONS : "WC";
-
-  time_t now = time(nullptr);
-  if (now > 1700000000) {
-    // yesterday (UTC) .. +3 days. Kept short so the decoded JSON body stays
-    // small in RAM; wide enough to show live + recent + next fixtures.
-    char from[11], to[11];
-    fmtDateUTC(now - 86400L,     from);
-    fmtDateUTC(now + 3L * 86400, to);
-    url += "&dateFrom=" + String(from) + "&dateTo=" + String(to);
-  }
+  String url = "http://";
+  url += SERVER_HOST;
+  url += ":";
+  url += String(SERVER_PORT);
+  if (gCurrentRound > 0) url += "/fixtures?round=" + String(gCurrentRound);
+  else                   url += "/today";
   return url;
 }
 
-// Fetch + parse matches. Returns true on success.
-static bool fetchMatches() {
-  if (WiFi.status() != WL_CONNECTED) {
-    connectWiFi();
-    if (WiFi.status() != WL_CONNECTED) { gOnline = false; return false; }
-  }
+// GET one matches-list endpoint and parse it into matches[]. When append is
+// false this resets matchCount (the primary/current-round fetch, whose
+// success also drives statusLine/gOnline); when true it adds on top of
+// whatever's already there (the next-round top-up) and stays silent on
+// failure - that round may simply not exist yet (e.g. no Final until the
+// Semifinals are done).
+static bool fetchMatchesFromUrl(const String &url, bool append) {
+  WiFiClient client;
+  HTTPClient http;
+  http.setTimeout(12000);
 
-  WiFiClientSecure client;
-  client.setInsecure();                 // football-data.org cert not pinned
-  HTTPClient https;
-  https.setTimeout(12000);
-
-  String url = buildUrl();
   Serial.printf("[HTTP] GET %s\n", url.c_str());
-  if (!https.begin(client, url)) {
-    strcpy(statusLine, "HTTPS begin failed");
-    Serial.println("[HTTP] begin() failed");
+  if (!http.begin(client, url)) {
+    if (!append) { strcpy(statusLine, "HTTP begin failed"); Serial.println("[HTTP] begin() failed"); }
     return false;
   }
-  https.addHeader("X-Auth-Token", API_TOKEN);
 
-  int code = https.GET();
-  Serial.printf("[HTTP] status=%d  contentLength=%d\n", code, https.getSize());
-  gOnline = (code == HTTP_CODE_OK);
+  int code = http.GET();
+  Serial.printf("[HTTP] status=%d  contentLength=%d\n", code, http.getSize());
+  if (!append) gOnline = (code == HTTP_CODE_OK);
   if (code != HTTP_CODE_OK) {
-    if (code == 429)      strcpy(statusLine, "Rate limited (10/min) - slow down");
-    else if (code == 403) strcpy(statusLine, "403 - competition not in free tier");
-    else if (code == 400) strcpy(statusLine, "400 - check API token / params");
-    else                  snprintf(statusLine, sizeof(statusLine), "HTTP error %d", code);
-    https.end();
+    if (!append) {
+      if (code == 404)     strcpy(statusLine, "404 - check /fixtures or /today on the server");
+      else if (code < 0)   snprintf(statusLine, sizeof(statusLine), "No server (%d) - check SERVER_HOST/PORT", code);
+      else                 snprintf(statusLine, sizeof(statusLine), "HTTP error %d", code);
+    }
+    http.end();
     return false;
   }
 
   // Only pull the fields we render -> keeps RAM use small.
   JsonDocument filter;
-  filter["matches"][0]["id"]                     = true;
-  filter["matches"][0]["status"]                 = true;
-  filter["matches"][0]["utcDate"]                = true;
-  filter["matches"][0]["stage"]                  = true;
-  filter["matches"][0]["group"]                  = true;
-  filter["matches"][0]["competition"]["code"]    = true;
-  filter["matches"][0]["homeTeam"]["tla"]        = true;
-  filter["matches"][0]["homeTeam"]["shortName"]  = true;
-  filter["matches"][0]["homeTeam"]["name"]       = true;
-  filter["matches"][0]["awayTeam"]["tla"]        = true;
-  filter["matches"][0]["awayTeam"]["shortName"]  = true;
-  filter["matches"][0]["awayTeam"]["name"]       = true;
-  filter["matches"][0]["score"]["fullTime"]["home"] = true;
-  filter["matches"][0]["score"]["fullTime"]["away"] = true;
-  filter["matches"][0]["score"]["halfTime"]["home"] = true;
+  filter["matches"][0]["id"]                = true;
+  filter["matches"][0]["round"]             = true;
+  filter["matches"][0]["group"]             = true;
+  filter["matches"][0]["home"]              = true;
+  filter["matches"][0]["away"]              = true;
+  filter["matches"][0]["homeScore"]         = true;
+  filter["matches"][0]["awayScore"]         = true;
+  filter["matches"][0]["status"]            = true;
+  filter["matches"][0]["statusDescription"] = true;
+  filter["matches"][0]["startTimestamp"]    = true;
 
-  // The API responds with Transfer-Encoding: chunked (contentLength = -1).
-  // getString() decodes the chunked body; the raw getStream() would leave the
-  // hex chunk-size markers in front of the JSON. Close the connection before
-  // parsing so the TLS buffers are freed first.
   Serial.printf("[MEM] free heap before read: %u\n", ESP.getFreeHeap());
-  String payload = https.getString();
-  https.end();
+  String payload = http.getString();
+  http.end();
   Serial.printf("[HTTP] body %u bytes\n", payload.length());
 
   JsonDocument doc;
@@ -875,46 +1136,85 @@ static bool fetchMatches() {
       deserializeJson(doc, payload, DeserializationOption::Filter(filter));
 
   if (err) {
-    snprintf(statusLine, sizeof(statusLine), "JSON error: %s", err.c_str());
+    if (!append) snprintf(statusLine, sizeof(statusLine), "JSON error: %s", err.c_str());
     Serial.printf("[JSON] %s\n", err.c_str());
     return false;
   }
 
+  if (!append) matchCount = 0;
+
   JsonArrayConst arr = doc["matches"].as<JsonArrayConst>();
-  matchCount = 0;
   for (JsonObjectConst mo : arr) {
     if (matchCount >= MAX_MATCHES) break;
+
+    long id = mo["id"] | 0L;
+    bool dup = false;
+    for (int i = 0; i < matchCount; i++) if (matches[i].id == id) { dup = true; break; }
+    if (dup) continue;   // current/next round fetches shouldn't overlap, but be safe
+
     Match &m = matches[matchCount];
 
     m.id = mo["id"] | 0L;
-    copyTeamId(mo["homeTeam"], m.home);
-    copyTeamId(mo["awayTeam"], m.away);
-    copyTeamName(mo["homeTeam"], m.homeName, sizeof(m.homeName));
-    copyTeamName(mo["awayTeam"], m.awayName, sizeof(m.awayName));
 
-    const char *st = mo["status"] | "SCHEDULED";
+    const char *homeName = mo["home"] | "";
+    const char *awayName = mo["away"] | "";
+    strncpy(m.homeName, homeName, sizeof(m.homeName) - 1); m.homeName[sizeof(m.homeName) - 1] = '\0';
+    strncpy(m.awayName, awayName, sizeof(m.awayName) - 1); m.awayName[sizeof(m.awayName) - 1] = '\0';
+    makeShortId(homeName, m.home);
+    makeShortId(awayName, m.away);
+
+    const char *st = mo["status"] | "notstarted";
     strncpy(m.status, st, sizeof(m.status) - 1); m.status[sizeof(m.status) - 1] = '\0';
+    const char *sd = mo["statusDescription"] | "";
+    strncpy(m.statusDescription, sd, sizeof(m.statusDescription) - 1);
+    m.statusDescription[sizeof(m.statusDescription) - 1] = '\0';
 
-    const char *cc = mo["competition"]["code"] | "";
-    strncpy(m.comp, cc, sizeof(m.comp) - 1); m.comp[sizeof(m.comp) - 1] = '\0';
-
-    const char *ud = mo["utcDate"] | "";
-    strncpy(m.utc, ud, sizeof(m.utc) - 1); m.utc[sizeof(m.utc) - 1] = '\0';
-
-    const char *sg = mo["stage"] | "";
-    strncpy(m.stage, sg, sizeof(m.stage) - 1); m.stage[sizeof(m.stage) - 1] = '\0';
+    m.round = mo["round"] | 0;
     const char *gp = mo["group"] | "";
     strncpy(m.group, gp, sizeof(m.group) - 1); m.group[sizeof(m.group) - 1] = '\0';
 
-    m.homeGoals = mo["score"]["fullTime"]["home"] | 0;
-    m.awayGoals = mo["score"]["fullTime"]["away"] | 0;
-    m.secondHalf = !mo["score"]["halfTime"]["home"].isNull();
-    utcToLocal(m.utc, m.kickoff);
-    m.koEpoch = isoToEpoch(m.utc);
+    m.homeGoals = mo["homeScore"] | 0;
+    m.awayGoals = mo["awayScore"] | 0;
+    m.koEpoch   = (time_t)(mo["startTimestamp"] | 0L);
+    m.secondHalf = containsCI(m.statusDescription, "2nd half");
+    epochToLocal(m.koEpoch, m.kickoff);
+
+    // Short round/group label for the compact row, e.g. "GRP A" or "R27".
+    const RoundName *rn = findRoundName(m.round);
+    if (m.group[0]) snprintf(m.comp, sizeof(m.comp), "GRP %c", m.group[strlen(m.group) - 1]);
+    else if (rn)    strncpy(m.comp, rn->shortLabel, sizeof(m.comp) - 1);
+    else             snprintf(m.comp, sizeof(m.comp), "R%d", m.round);
+    m.comp[sizeof(m.comp) - 1] = '\0';
+
     matchCount++;
   }
 
-  Serial.printf("[PARSE] %d matches\n", matchCount);
+  Serial.printf("[PARSE] %d matches (append=%d), now %d total\n", arr.size(), (int)append, matchCount);
+  return true;
+}
+
+// Fetch + parse matches: the current round (or /today until the first
+// /rounds lookup succeeds), topped up with the next round in tournament
+// order so Results/All still show upcoming fixtures once every match in the
+// current round has finished. Returns true if the primary fetch succeeded.
+static bool fetchMatches() {
+  if (WiFi.status() != WL_CONNECTED) {
+    connectWiFi();
+    if (WiFi.status() != WL_CONNECTED) { gOnline = false; return false; }
+  }
+
+  fetchCurrentRound();   // best-effort; keeps gCurrentRound/gNextRound fresh across round transitions
+
+  bool ok = fetchMatchesFromUrl(buildUrl(), false);
+
+  if (ok && gCurrentRound > 0 && gNextRound > 0) {
+    String nextUrl = "http://" + String(SERVER_HOST) + ":" + String(SERVER_PORT) +
+                      "/fixtures?round=" + String(gNextRound);
+    fetchMatchesFromUrl(nextUrl, true);   // best-effort top-up, ignore failure
+  }
+
+  if (!ok) return false;
+
   sortMatches();
 
   // Watch the top match's half-time transition on EVERY poll (independent of
@@ -925,7 +1225,7 @@ static bool fetchMatches() {
     if (isLive(matches[i])) { gAnyLive = true; break; }
   if (matchCount > 0) trackHalfTime(matches[0]);
 
-  if (matchCount == 0) strcpy(statusLine, "No matches in range");
+  if (matchCount == 0) strcpy(statusLine, "No matches right now");
   return true;
 }
 
@@ -1057,9 +1357,9 @@ void loop() {
 
   // Periodic data fetch. Repaint ONLY when the data actually changed, so an
   // unchanged refresh no longer triggers a full-screen redraw. While a match is
-  // live we poll every ~20s (3 req/min, well under the free tier's 10/min) so
-  // the PAUSED->IN_PLAY restart is caught quickly and the 2nd-half clock anchors
-  // tightly; otherwise we use the configured interval.
+  // live we poll every ~20s so the Halftime -> 2nd-half restart is caught
+  // quickly and the 2nd-half clock anchors tightly; otherwise we use the
+  // configured interval.
   uint32_t liveSecs  = (REFRESH_SECONDS < 20) ? (uint32_t)REFRESH_SECONDS : 20;
   uint32_t fetchSecs = gAnyLive ? liveSecs : (uint32_t)REFRESH_SECONDS;
   if (now - lastFetch >= fetchSecs * 1000UL) {

@@ -5,24 +5,27 @@
 // =============================================================================
 
 // --- WiFi ---------------------------------------------------------------------
-#define WIFI_SSID      "Hello"
-#define WIFI_PASSWORD  "12345678901"
+#define WIFI_SSID      "SargasanHome"
+#define WIFI_PASSWORD  "Sargasan@123#"
 
-// --- football-data.org --------------------------------------------------------
-// Get a free token at https://www.football-data.org/client/register
-// It is sent in the "X-Auth-Token" header on every request.
-#define API_TOKEN      "cc66f87687814dfea6415d758c32715d"
+// --- Local FIFA World Cup server ------------------------------------------------
+// This firmware polls the local Python scraper/API server (see README.md), not
+// football-data.org. The ESP32 and the PC running `python main.py` must be on
+// the same WiFi network. SERVER_HOST is that PC's LAN IP (find it with
+// `ipconfig`, NOT "localhost"/"127.0.0.1" - that would point at the ESP32
+// itself). SERVER_PORT matches the server's PORT env var (8000 by default).
+#define SERVER_HOST    "192.168.29.196"
+#define SERVER_PORT    8000
 
-// Which competitions to show today's matches for (comma separated, NO spaces).
-// Free "Tier One" codes: PL (Premier League), PD (La Liga), SA (Serie A),
-// BL1 (Bundesliga), FL1 (Ligue 1), DED (Eredivisie), PPL (Primeira Liga),
-// ELC (Championship), CL (Champions League), EC, WC, BSA.
-// Leave as "" to show every available competition for today.
-#define COMPETITIONS   "WC"
+// No endpoint to configure here: the firmware asks GET /rounds for the
+// tournament's current round, then pulls GET /fixtures?round=<that> - it
+// covers live + finished + upcoming matches for the whole round regardless
+// of date, so Results/All still have data on rest days between rounds
+// (unlike /today, which is empty whenever nothing's scheduled today).
 
-// How often to refresh, in seconds. Free tier allows 10 requests/minute, so
-// keep this at 30 or higher to stay well under the limit.
-#define REFRESH_SECONDS  60
+// How often to refresh, in seconds. The server itself caches responses
+// (20s for /live, 5min for others), so there's no need to go much below that.
+#define REFRESH_SECONDS  30
 
 // --- Local time ---------------------------------------------------------------
 // Offset from UTC for displaying kickoff times & the clock, in minutes.
