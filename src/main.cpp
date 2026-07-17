@@ -84,6 +84,7 @@ struct Match {
   char awayName[26];
   time_t koEpoch;    // kick-off as UTC epoch (server's startTimestamp, for the live clock)
   bool   secondHalf; // statusDescription says "2nd half" (or later)
+  int    minute;     // server's live match minute, -1 if absent (HT/pre-KO/FT/penalties)
   char comp[8];      // short round/group label for the compact row, e.g. "GRP A" / "R27"
   int  round;
   int  homeGoals;
@@ -119,12 +120,12 @@ static bool   gAnyLive = false;     // any match in play -> poll faster (see loo
 //  tapping them cycles through the screens. Touch comes from the XPT2046
 //  controller (TOUCH_CS in User_Setup.h), calibrated once and saved to LittleFS.
 // ----------------------------------------------------------------------------
-enum Page { PAGE_FEATURED = 0, PAGE_ALL, PAGE_RESULTS, PAGE_LINEUPS, PAGE_COUNT };
+enum Page { PAGE_FEATURED = 0, PAGE_ALL, PAGE_RESULTS, PAGE_LINEUPS, PAGE_PHOTOS, PAGE_COUNT };
 static int gPage = PAGE_FEATURED;
 static uint32_t gLastContentSig = 0;   // last painted content hash (see loop)
 static int  gRenderedPage = -1;        // page currently on screen
 static long gHeroDrawnId  = -1;        // id of the match whose card is on screen
-static const char *kPageTitle[PAGE_COUNT] = { "FEATURED", "ALL MATCHES", "RESULTS", "LINE-UPS" };
+static const char *kPageTitle[PAGE_COUNT] = { "FEATURED", "ALL MATCHES", "RESULTS", "LINE-UPS", "PHOTOS" };
 
 static const int FOOTER_H    = 40;
 static const int FOOTER_Y    = SCREEN_H - FOOTER_H;    // 280
@@ -246,9 +247,17 @@ static void epochToLocal(time_t ts, char *out) {
 }
 
 // Halftime is reported as status "inprogress" with a "Halftime" description,
-// not a separate status value.
+// not a separate status value. Same idea for extra time (knockout matches
+// only) and penalties - all still just "inprogress" with a description that
+// says what's actually happening.
 static bool isHalftime(const Match &m) {
   return containsCI(m.statusDescription, "halftime") || containsCI(m.statusDescription, "half time");
+}
+static bool isExtraTime(const Match &m) {
+  return containsCI(m.statusDescription, "extra");
+}
+static bool isPenalties(const Match &m) {
+  return containsCI(m.statusDescription, "penalt");
 }
 static bool isLive(const Match &m) {
   return !strcmp(m.status, "inprogress");
@@ -286,7 +295,9 @@ static void sortMatches() {
 // Returns a short status badge ("LIVE", "HT", "FT", or kickoff time) + colour.
 static const char *badgeFor(const Match &m, uint16_t &colour) {
   if (!strcmp(m.status, "inprogress")) {
-    if (isHalftime(m)) { colour = COL_HT; return "HT"; }
+    if (isHalftime(m))  { colour = COL_HT;   return "HT";   }
+    if (isPenalties(m)) { colour = COL_HT;   return "PENS"; }
+    if (isExtraTime(m)) { colour = COL_LIVE; return "ET";   }
     colour = COL_LIVE; return "LIVE";
   }
   if (!strcmp(m.status, "finished"))                                        { colour = COL_FT;  return "FT";   }
@@ -351,17 +362,17 @@ static void stageLabel(const Match &m, char *out, size_t n) {
 // made rows visibly paint one at a time. tft/headerSpr/rowSpr are the only
 // targets ever passed in, so a tiny fixed-size cache of (target, last size)
 // is enough to skip the reload whenever the size hasn't actually changed.
+static const TFT_eSPI *gFontCacheTarget[3] = { nullptr, nullptr, nullptr };
+static int             gFontCachePx[3]     = { -1, -1, -1 };
+
 static void setUiFont(TFT_eSPI &g, int px) {
   if (gSmoothFonts) {
-    static const TFT_eSPI *lastTarget[3] = { nullptr, nullptr, nullptr };
-    static int             lastPx[3]     = { -1, -1, -1 };
-
     int slot = -1, freeSlot = -1;
     for (int i = 0; i < 3; i++) {
-      if (lastTarget[i] == &g) { slot = i; break; }
-      if (lastTarget[i] == nullptr && freeSlot < 0) freeSlot = i;
+      if (gFontCacheTarget[i] == &g) { slot = i; break; }
+      if (gFontCacheTarget[i] == nullptr && freeSlot < 0) freeSlot = i;
     }
-    if (slot >= 0 && lastPx[slot] == px) return;   // already loaded - skip reload
+    if (slot >= 0 && gFontCachePx[slot] == px) return;   // already loaded - skip reload
     if (slot < 0) slot = freeSlot;
 
     g.unloadFont();
@@ -370,7 +381,7 @@ static void setUiFont(TFT_eSPI &g, int px) {
                                : "fonts/OpenSans16";
     g.loadFont(f, LittleFS);
 
-    if (slot >= 0) { lastTarget[slot] = &g; lastPx[slot] = px; }
+    if (slot >= 0) { gFontCacheTarget[slot] = &g; gFontCachePx[slot] = px; }
   } else {
     g.setFreeFont((px >= 30) ? &FreeSansBold24pt7b
                 : (px >= 20) ? &FreeSansBold12pt7b
@@ -378,6 +389,22 @@ static void setUiFont(TFT_eSPI &g, int px) {
   }
 }
 static void setUiFont(int px) { setUiFont(tft, px); }
+
+// Switch to the tiny built-in GLCD font (8px) for compact UI chrome like the
+// Photos page's jersey-number badges. Just calling setTextFont(1) isn't
+// enough while a smooth (VLW) font is loaded: TFT_eSPI's drawChar() always
+// prefers the loaded smooth font over `textfont` until unloadFont() is
+// called - which is why those badges were rendering at the last smooth-font
+// size instead of tiny digits. Invalidates this target's setUiFont() cache
+// slot too, so the next setUiFont() call actually reloads instead of assuming
+// nothing changed.
+static void useTinyFont(TFT_eSPI &g) {
+  if (gSmoothFonts) {
+    g.unloadFont();
+    for (int i = 0; i < 3; i++) if (gFontCacheTarget[i] == &g) gFontCachePx[i] = -1;
+  }
+  g.setTextFont(1);
+}
 
 // ----------------------------------------------------------------------------
 //  Flags  (PNG files on LittleFS, named /flags/<tla>.png, e.g. /flags/rsa.png)
@@ -391,6 +418,10 @@ static void setUiFont(int px) { setUiFont(tft, px); }
 // during a data fetch.
 static PNG         *g_png = nullptr;
 static TFT_eSprite *g_pngTarget = nullptr;   // sprite the decoder writes into
+// Background to alpha-blend transparent pixels against, packed as 0x00BBGGRR.
+// 0xffffffff tells PNGdec to skip blending entirely (fine for opaque flags);
+// player photos are real RGBA cutouts, so they set this to COL_BG first.
+static uint32_t g_pngBkgd = 0xffffffff;
 
 // PNGdec line callback: convert each scanline to native RGB565 and write it
 // pixel-by-pixel into the target sprite. Using LITTLE_ENDIAN + drawPixel keeps
@@ -398,7 +429,7 @@ static TFT_eSprite *g_pngTarget = nullptr;   // sprite the decoder writes into
 static int pngDraw(PNGDRAW *pDraw) {
   static uint16_t lineBuf[200];
   if (!g_png || !g_pngTarget || pDraw->iWidth > 200) return 0;
-  g_png->getLineAsRGB565(pDraw, lineBuf, PNG_RGB565_LITTLE_ENDIAN, 0xffffffff);
+  g_png->getLineAsRGB565(pDraw, lineBuf, PNG_RGB565_LITTLE_ENDIAN, g_pngBkgd);
   for (int x = 0; x < pDraw->iWidth; x++)
     g_pngTarget->drawPixel(x, pDraw->y, lineBuf[x]);
   return 1;
@@ -428,6 +459,7 @@ static bool decodeFlagPng(const char *key, TFT_eSprite &spr, uint16_t &w, uint16
       sprOk = (w && h && w <= 200 && spr.createSprite(w, h));
       if (sprOk) {
         g_pngTarget = &spr;
+        g_pngBkgd = 0xffffffff;   // flags: no alpha blending
         rcDec = g_png->decode(nullptr, 0);
         ok = (rcDec == PNG_SUCCESS);
         g_pngTarget = nullptr;
@@ -503,8 +535,11 @@ static void drawFlagCircle(int cx, int cy, int d, const char *tla) {
 static const int HERO_SCORE_Y = HERO_Y + 78;
 static const int HERO_TIMER_Y = HERO_Y + 116;
 
-// Draws the red elapsed-time clock (mm:ss since kick-off) under the score.
-// The server doesn't expose a live match minute, so this is wall-clock since kick-off.
+// Draws the red match-minute clock under the score. Prefers the server's own
+// "minute" field (a real running count from SofaScore's period-start data -
+// it keeps counting past 45/90, so "minute - 45" is genuine added time, e.g.
+// "45+2'"), falling back to a wall-clock-since-kickoff estimate for the rare
+// case the field is absent while the match is still live.
 static void drawLiveTimer(bool force = false) {
   int cx = HERO_X + HERO_W / 2;
 
@@ -515,16 +550,34 @@ static void drawLiveTimer(bool force = false) {
   if (isHalftime(heroMatch)) {
     strcpy(t, "HALF TIME");
     col = COL_HT;
+  } else if (isPenalties(heroMatch)) {
+    strcpy(t, "PENALTIES");
+    col = COL_HT;
+  } else if (heroMatch.minute >= 0) {
+    int mins = heroMatch.minute;
+    if (isExtraTime(heroMatch)) {
+      // Extra time's own two 15-min halves run past 90 as a fresh continuous
+      // count (91, 93, 106...), confirmed against the server's own event
+      // timeline - it's a real minute, not stoppage tacked onto the 90.
+      snprintf(t, sizeof(t), "%d'", mins);
+    } else if (!heroMatch.secondHalf && mins > 45) {
+      snprintf(t, sizeof(t), "45+%d'", mins - 45);
+    } else if (heroMatch.secondHalf && mins > 90) {
+      snprintf(t, sizeof(t), "90+%d'", mins - 90);
+    } else {
+      snprintf(t, sizeof(t), "%d'", mins);
+    }
+    col = COL_LIVE;
   } else if (heroMatch.secondHalf &&
              !(gTrackedId == heroMatch.id && gSecondHalfKO > 0)) {
     // 2nd half, but we never saw the restart (e.g. the board was switched on
-    // mid-half). The server gives no live minute, and "elapsed - 15" would
-    // over-count by first-half stoppage + the real break length - that's how
-    // 57' ends up shown as 64'. Print an honest label instead of a fake number.
+    // mid-half) and the server gave no minute this time either. "elapsed - 15"
+    // would over-count by first-half stoppage + the real break length - that's
+    // how 57' ends up shown as 64'. Print an honest label instead of a fake number.
     strcpy(t, "2ND HALF");
     col = COL_LIVE;
   } else {
-    // Accurate minute:
+    // Wall-clock fallback:
     //  - 1st half: minutes since kick-off (no break yet)
     //  - 2nd half: 45 + time since the restart we anchored ourselves
     time_t now = time(nullptr);
@@ -818,6 +871,7 @@ struct LineupPlayer {
   char name[23];
   char pos;     // 'G' / 'D' / 'M' / 'F'
   int  jersey;
+  long id;      // SofaScore player id -> GET /player/{id}/image
 };
 struct TeamLineup {
   char formation[8];
@@ -846,6 +900,7 @@ static void parseLineupTeam(JsonObjectConst teamObj, TeamLineup &out, const char
     const char *pos = p["position"] | "";
     lp.pos = pos[0] ? pos[0] : '?';
     lp.jersey = atoi(p["jerseyNumber"] | "0");
+    lp.id = p["id"] | 0L;
     out.count++;
   }
 }
@@ -877,11 +932,13 @@ static bool fetchLineups(long matchId) {
   filter["home"]["players"][0]["position"]     = true;
   filter["home"]["players"][0]["jerseyNumber"] = true;
   filter["home"]["players"][0]["substitute"]   = true;
+  filter["home"]["players"][0]["id"]           = true;
   filter["away"]["formation"]                  = true;
   filter["away"]["players"][0]["name"]         = true;
   filter["away"]["players"][0]["position"]     = true;
   filter["away"]["players"][0]["jerseyNumber"] = true;
   filter["away"]["players"][0]["substitute"]   = true;
+  filter["away"]["players"][0]["id"]           = true;
 
   String payload = http.getString();
   http.end();
@@ -950,6 +1007,229 @@ static void drawLineups() {
   }
 }
 
+// ----------------------------------------------------------------------------
+//  Photos page: both teams' starting XI shown at once on a single horizontal
+//  pitch, players positioned by formation line (GK -> defence -> ... ->
+//  attack), home attacking rightwards, away mirrored attacking leftwards -
+//  the two front lines meet at the halfway circle, matching how SofaScore's
+//  own lineup graphic reads. Headshots come from GET /player/{id}/image on
+//  the local server (a real 64x64 PNG - the server already decoded
+//  SofaScore's WebP and downscaled it, cached 24h).
+// ----------------------------------------------------------------------------
+static const int PHOTO_DIA = 32;   // circular headshot diameter on the pitch
+
+static TFT_eSprite *gHomePhotoSpr[11] = { nullptr };
+static TFT_eSprite *gAwayPhotoSpr[11] = { nullptr };
+static int          gHomePhotoW[11] = { 0 }, gHomePhotoH[11] = { 0 };
+static int          gAwayPhotoW[11] = { 0 }, gAwayPhotoH[11] = { 0 };
+static long         gPhotoMatchId = -1;   // match whose photos are currently loaded
+
+// Fetch one player's headshot into spr. Returns false (spr left empty) on any
+// network/decode failure - caller draws a lettered placeholder disc instead,
+// same fallback style as team flags.
+static bool fetchPlayerPhoto(long playerId, TFT_eSprite &spr, int &w, int &h) {
+  if (playerId <= 0 || WiFi.status() != WL_CONNECTED) return false;
+
+  WiFiClient client;
+  HTTPClient http;
+  http.setTimeout(8000);
+  String url = "http://" + String(SERVER_HOST) + ":" + String(SERVER_PORT) +
+               "/player/" + String(playerId) + "/image";
+
+  if (!http.begin(client, url)) return false;
+  int code = http.GET();
+  if (code != HTTP_CODE_OK) { http.end(); return false; }
+
+  int sz = http.getSize();
+  if (sz <= 0 || sz > 20000) { http.end(); return false; }   // sanity cap
+  uint8_t *buf = (uint8_t *)malloc(sz);
+  if (!buf) { http.end(); return false; }
+
+  WiFiClient *stream = http.getStreamPtr();
+  int total = 0;
+  uint32_t deadline = millis() + 8000;
+  while (total < sz && millis() < deadline) {
+    int n = stream->read(buf + total, sz - total);
+    if (n > 0) total += n;
+    else if (!http.connected() && stream->available() == 0) break;
+  }
+  http.end();
+  if (total != sz) { free(buf); return false; }
+
+  bool ok = false;
+  g_png = new PNG();
+  if (g_png) {
+    if (g_png->openRAM(buf, sz, pngDraw) == PNG_SUCCESS) {
+      w = g_png->getWidth();
+      h = g_png->getHeight();
+      if (w && h && w <= 200 && spr.createSprite(w, h)) {
+        g_pngTarget = &spr;
+        g_pngBkgd = 0x000000;   // photos are real RGBA cutouts - blend onto COL_BG (black)
+        ok = (g_png->decode(nullptr, 0) == PNG_SUCCESS);
+        g_pngTarget = nullptr;
+      }
+    }
+    g_png->close();
+    delete g_png;
+    g_png = nullptr;
+  }
+  free(buf);
+  return ok;
+}
+
+// Free any thumbnails from a previously-loaded match before fetching new ones.
+static void clearPhotoSprites(TFT_eSprite **spr, int *ws, int *hs) {
+  for (int i = 0; i < 11; i++) {
+    if (spr[i]) { spr[i]->deleteSprite(); delete spr[i]; spr[i] = nullptr; }
+    ws[i] = hs[i] = 0;
+  }
+}
+
+// Blocking fetch+decode of one team's starting XI headshots - only runs once
+// per match (same "blocking once" style as fetchLineups), not every redraw.
+static void loadPhotosForTeam(const TeamLineup &team, TFT_eSprite **spr, int *ws, int *hs) {
+  clearPhotoSprites(spr, ws, hs);
+  for (int i = 0; i < team.count && i < 11; i++) {
+    spr[i] = new TFT_eSprite(&tft);
+    if (!fetchPlayerPhoto(team.starters[i].id, *spr[i], ws[i], hs[i])) {
+      spr[i]->deleteSprite();
+      delete spr[i];
+      spr[i] = nullptr;
+    }
+  }
+}
+
+// Pitch play area (thin border matching the touchlines/halfway circle in
+// SofaScore's own lineup graphic - see the reference screenshot).
+static const int PITCH_TOP = CONTENT_TOP + 4;
+static const int PITCH_BOT = FOOTER_Y - 4;
+static const int PITCH_H   = PITCH_BOT - PITCH_TOP;
+
+static void drawPitchLines() {
+  int cx = SCREEN_W / 2, cy = PITCH_TOP + PITCH_H / 2;
+  tft.drawRect(4, PITCH_TOP, SCREEN_W - 8, PITCH_H, COL_CARD_TOP);
+  tft.drawFastVLine(cx, PITCH_TOP, PITCH_H, COL_CARD_TOP);
+  tft.drawCircle(cx, cy, 34, COL_CARD_TOP);
+}
+
+// Draw one circular headshot (cover-fit + circular mask, same technique as
+// drawFlagCircle) plus a jersey-number badge and last name. Falls back to a
+// lettered disc when spr is null (fetch/decode failed for that player).
+static void drawPlayerCircle(int cx, int cy, TFT_eSprite *spr, int sw, int sh, const LineupPlayer &p) {
+  int r = PHOTO_DIA / 2;
+  bool haveImg = spr && sw > 0 && sh > 0;
+
+  TFT_eSprite dst(&tft);
+  if (dst.createSprite(PHOTO_DIA, PHOTO_DIA)) {
+    dst.fillSprite(COL_BG);
+    float scale = haveImg ? max((float)PHOTO_DIA / sw, (float)PHOTO_DIA / sh) : 1.0f;
+    int offX = haveImg ? (int)(sw * scale - PHOTO_DIA) / 2 : 0;
+    int offY = haveImg ? (int)(sh * scale - PHOTO_DIA) / 2 : 0;
+
+    for (int y = 0; y < PHOTO_DIA; y++) {
+      int dy2 = y - r;
+      for (int x = 0; x < PHOTO_DIA; x++) {
+        int dx2 = x - r;
+        if (dx2 * dx2 + dy2 * dy2 > r * r) continue;   // outside circle
+        uint16_t c = COL_FLAG_BG;
+        if (haveImg) {
+          int sx = (int)((x + offX) / scale), sy = (int)((y + offY) / scale);
+          if (sx < 0) sx = 0; if (sx >= sw) sx = sw - 1;
+          if (sy < 0) sy = 0; if (sy >= sh) sy = sh - 1;
+          c = spr->readPixel(sx, sy);
+        }
+        dst.drawPixel(x, y, c);
+      }
+    }
+    dst.pushSprite(cx - r, cy - r, COL_BG);
+    dst.deleteSprite();
+  }
+  tft.drawCircle(cx, cy, r, COL_CARD_TOP);
+
+  char num[4];
+  snprintf(num, sizeof(num), "%d", p.jersey);
+  if (!haveImg) {
+    tft.setTextDatum(MC_DATUM);
+    useTinyFont(tft);
+    tft.setTextColor(COL_TEXT, COL_FLAG_BG);
+    tft.drawString(num, cx, cy);
+  }
+
+  // Jersey-number badge sitting just below the circle, tangent to its edge
+  // (not overlapping the photo - the earlier corner-overlap placement let the
+  // number spill outside the badge onto the face).
+  int by = cy + r + 6;
+  tft.fillRoundRect(cx - 8, by - 6, 16, 12, 3, COL_HT);
+  tft.setTextDatum(MC_DATUM);
+  useTinyFont(tft);
+  tft.setTextColor(COL_BG, COL_HT);
+  tft.drawString(num, cx, by);
+}
+
+// Parse "4-2-3-1" -> {4,2,3,1}. Returns the number of outfield lines (the
+// keeper isn't part of the formation string - the API always gives exactly
+// one, handled as an implicit extra column by the caller).
+static int parseFormationLines(const char *formation, int *lines, int maxLines) {
+  int n = 0, cur = 0;
+  bool any = false;
+  for (const char *p = formation; ; p++) {
+    if (*p >= '0' && *p <= '9') { cur = cur * 10 + (*p - '0'); any = true; }
+    else {
+      if (any && n < maxLines) { lines[n++] = cur; cur = 0; any = false; }
+      if (*p == '\0') break;
+    }
+  }
+  return n;
+}
+
+// Lay out one team's starters by formation line: column 0 is the keeper,
+// columns 1..N are the outfield lines in defence -> attack order, matching
+// the order players already appear in team.starters[] (SofaScore returns
+// them in that same formation-slot order). home attacks rightwards; away is
+// mirrored so both front lines end up near the halfway circle.
+static void drawTeamFormation(const TeamLineup &team, TFT_eSprite **spr, int *ws, int *hs, bool mirrored) {
+  int outfield[6];
+  int nLines = parseFormationLines(team.formation, outfield, 6);
+  if (nLines == 0 || team.count == 0) return;
+
+  int totalCols = nLines + 1;
+  int edgeX = mirrored ? SCREEN_W - 30 : 30;             // own goal line
+  int nearX = mirrored ? SCREEN_W / 2 + 26 : SCREEN_W / 2 - 26;   // just short of halfway
+
+  int idx = 0;
+  for (int col = 0; col < totalCols && idx < team.count; col++) {
+    int lineCount = (col == 0) ? 1 : outfield[col - 1];
+    float t = (totalCols == 1) ? 0.f : (float)col / (totalCols - 1);
+    int x = edgeX + (int)((nearX - edgeX) * t);
+
+    for (int j = 0; j < lineCount && idx < team.count; j++, idx++) {
+      int y = PITCH_TOP + (int)(PITCH_H * (float)(j + 1) / (lineCount + 1));
+      drawPlayerCircle(x, y, spr[idx], ws[idx], hs[idx], team.starters[idx]);
+    }
+  }
+}
+
+// Both teams' starting XI on one pitch - home left-to-right, away mirrored.
+static void drawPhotos() {
+  tft.fillRect(0, CONTENT_TOP, SCREEN_W, CONTENT_H, COL_BG);
+
+  const Match &featured = matches[0];
+  if (gLineupMatchId != featured.id) fetchLineups(featured.id);   // shares the text page's cache
+  if (!gLineupOk) { drawMessage("Lineups unavailable", COL_DIM); return; }
+
+  if (gPhotoMatchId != featured.id) {
+    drawMessage("Loading player photos...", COL_DIM);
+    loadPhotosForTeam(gHomeLineup, gHomePhotoSpr, gHomePhotoW, gHomePhotoH);
+    loadPhotosForTeam(gAwayLineup, gAwayPhotoSpr, gAwayPhotoW, gAwayPhotoH);
+    gPhotoMatchId = featured.id;
+    tft.fillRect(0, CONTENT_TOP, SCREEN_W, CONTENT_H, COL_BG);   // clear the loading message
+  }
+
+  drawPitchLines();
+  drawTeamFormation(gHomeLineup, gHomePhotoSpr, gHomePhotoW, gHomePhotoH, false);
+  drawTeamFormation(gAwayLineup, gAwayPhotoSpr, gAwayPhotoW, gAwayPhotoH, true);
+}
+
 // A cheap hash of everything that affects the on-screen content. The loop only
 // repaints the screen when this changes, so a fetch that returns identical data
 // no longer triggers a jarring full-screen redraw.
@@ -962,7 +1242,12 @@ static uint32_t contentSignature() {
     const Match &m = matches[i];
     mix((uint32_t)m.id);
     mix((uint32_t)(m.homeGoals * 257 + m.awayGoals));
+    mix((uint32_t)(m.minute + 1));   // ticks every live fetch; +1 so "-1" (absent) still mixes
     for (const char *p = m.status; *p; p++) mix((uint8_t)*p);
+    // statusDescription too: "Halftime" -> "2nd half" keeps status=="inprogress",
+    // so without this the HT->live transition (and the live minute label with
+    // it) would never trigger a repaint - the board would just freeze on HT.
+    for (const char *p = m.statusDescription; *p; p++) mix((uint8_t)*p);
   }
   return h;
 }
@@ -978,6 +1263,8 @@ static void render() {
     drawFeatured();        // clears the band itself, only when the card changes
   } else if (gPage == PAGE_LINEUPS) {
     drawLineups();          // clears the band itself
+  } else if (gPage == PAGE_PHOTOS) {
+    drawPhotos();           // clears the band itself
   } else {
     // List pages: clear and redraw the rows (cheap, no flag decode).
     tft.fillRect(0, CONTENT_TOP, SCREEN_W, CONTENT_H, COL_BG);
@@ -1125,6 +1412,7 @@ static bool fetchMatchesFromUrl(const String &url, bool append) {
   filter["matches"][0]["status"]            = true;
   filter["matches"][0]["statusDescription"] = true;
   filter["matches"][0]["startTimestamp"]    = true;
+  filter["matches"][0]["minute"]            = true;
 
   Serial.printf("[MEM] free heap before read: %u\n", ESP.getFreeHeap());
   String payload = http.getString();
@@ -1176,6 +1464,7 @@ static bool fetchMatchesFromUrl(const String &url, bool append) {
     m.homeGoals = mo["homeScore"] | 0;
     m.awayGoals = mo["awayScore"] | 0;
     m.koEpoch   = (time_t)(mo["startTimestamp"] | 0L);
+    m.minute    = mo["minute"] | -1;   // null (HT/pre-KO/FT/penalties) -> -1
     m.secondHalf = containsCI(m.statusDescription, "2nd half");
     epochToLocal(m.koEpoch, m.kickoff);
 
@@ -1191,6 +1480,60 @@ static bool fetchMatchesFromUrl(const String &url, bool append) {
 
   Serial.printf("[PARSE] %d matches (append=%d), now %d total\n", arr.size(), (int)append, matchCount);
   return true;
+}
+
+// Overlay fresher live-match fields from GET /live (20s server cache) onto
+// whatever fetchMatchesFromUrl() already populated from /fixtures?round=N
+// (5min server cache). Without this, a live match's minute/status/score only
+// actually changes every 5 minutes no matter how often the firmware polls,
+// since /fixtures keeps returning the same cached response until its TTL
+// expires. /live is tiny (~24 bytes idle, low hundreds per live match) so
+// it's cheap to call every cycle regardless of whether anything is live yet.
+static void applyLiveOverlay() {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  WiFiClient client;
+  HTTPClient http;
+  http.setTimeout(8000);
+  String url = "http://" + String(SERVER_HOST) + ":" + String(SERVER_PORT) + "/live";
+  if (!http.begin(client, url)) return;
+
+  int code = http.GET();
+  if (code != HTTP_CODE_OK) { http.end(); return; }
+
+  JsonDocument filter;
+  filter["matches"][0]["id"]                = true;
+  filter["matches"][0]["homeScore"]         = true;
+  filter["matches"][0]["awayScore"]         = true;
+  filter["matches"][0]["status"]            = true;
+  filter["matches"][0]["statusDescription"] = true;
+  filter["matches"][0]["minute"]            = true;
+
+  String payload = http.getString();
+  http.end();
+
+  JsonDocument doc;
+  if (deserializeJson(doc, payload, DeserializationOption::Filter(filter))) return;
+
+  for (JsonObjectConst mo : doc["matches"].as<JsonArrayConst>()) {
+    long id = mo["id"] | 0L;
+    for (int i = 0; i < matchCount; i++) {
+      if (matches[i].id != id) continue;
+      Match &m = matches[i];
+      m.homeGoals = mo["homeScore"] | m.homeGoals;
+      m.awayGoals = mo["awayScore"] | m.awayGoals;
+
+      const char *st = mo["status"] | m.status;
+      strncpy(m.status, st, sizeof(m.status) - 1); m.status[sizeof(m.status) - 1] = '\0';
+      const char *sd = mo["statusDescription"] | m.statusDescription;
+      strncpy(m.statusDescription, sd, sizeof(m.statusDescription) - 1);
+      m.statusDescription[sizeof(m.statusDescription) - 1] = '\0';
+
+      m.minute     = mo["minute"] | -1;
+      m.secondHalf = containsCI(m.statusDescription, "2nd half");
+      break;
+    }
+  }
 }
 
 // Fetch + parse matches: the current round (or /today until the first
@@ -1214,6 +1557,8 @@ static bool fetchMatches() {
   }
 
   if (!ok) return false;
+
+  applyLiveOverlay();   // best-effort; refreshes live fields ahead of the 5min /fixtures cache
 
   sortMatches();
 
