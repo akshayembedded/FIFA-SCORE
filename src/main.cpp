@@ -135,7 +135,7 @@ static const int CONTENT_H   = CONTENT_BOT - CONTENT_TOP;
 
 // Hero card geometry (centred in the content band on the FEATURED page)
 static const int HERO_X = 6;
-static const int HERO_H = 158;
+static const int HERO_H = 196;   // tall enough to fit the goals strip below the timer
 static const int HERO_Y = CONTENT_TOP + (CONTENT_H - HERO_H) / 2;
 static const int HERO_W = SCREEN_W - 12;
 
@@ -235,6 +235,14 @@ static bool containsCI(const char *hay, const char *needle) {
     if (j == nl) return true;
   }
   return false;
+}
+
+// Last space-separated token of a full name, e.g. "Cristiano Ronaldo" ->
+// "Ronaldo". The hero card's goal strip only has room for a surname.
+static const char *lastToken(const char *s) {
+  const char *last = s;
+  for (const char *p = s; *p; p++) if (*p == ' ' && p[1]) last = p + 1;
+  return last;
 }
 
 // Convert a UTC epoch (server's startTimestamp) to local "HH:MM".
@@ -535,6 +543,10 @@ static void drawFlagCircle(int cx, int cy, int d, const char *tla) {
 static const int HERO_SCORE_Y = HERO_Y + 78;
 static const int HERO_TIMER_Y = HERO_Y + 116;
 
+// Goal-scorer strip: below the timer, two columns (home | away).
+static const int HERO_GOALS_Y = HERO_Y + 134;
+static const int HERO_GOALS_H = HERO_H - 134 - 6;
+
 // Draws the red match-minute clock under the score. Prefers the server's own
 // "minute" field (a real running count from SofaScore's period-start data -
 // it keeps counting past 45/90, so "minute - 45" is genuine added time, e.g.
@@ -661,6 +673,150 @@ static void drawHeroDynamic(const Match &m) {
     tft.setTextColor(COL_SCHED, COL_CARD);
     tft.drawString("KICK-OFF", cx, HERO_TIMER_Y);
   }
+}
+
+// ----------------------------------------------------------------------------
+//  Goal events (scorer + assist) for the hero card, from GET
+//  /match/{id}/events on the local server. Unlike lineups, goals can still
+//  happen after the first fetch while a match is live, so this can't be a
+//  once-per-match cache - it re-fetches whenever the featured match's goal
+//  tally ticks up, not just when the match itself changes.
+// ----------------------------------------------------------------------------
+struct GoalEvent {
+  int  minute;
+  bool isHome;      // true = home team scored
+  char player[23];
+  char assist[23];
+  bool hasAssist;
+  bool ownGoal;
+  bool penalty;
+};
+static const int MAX_GOAL_EVENTS = 12;
+static GoalEvent gGoalEvents[MAX_GOAL_EVENTS];
+static int       gGoalEventCount  = 0;
+static long      gEventsMatchId   = -1;   // match whose goals are currently loaded
+static int       gEventsGoalTotal = -1;   // home+away goals as of the last successful fetch
+
+// Fetch + parse /match/{id}/events, keeping only "goal" entries (cards/subs/
+// delays are filtered out here rather than server-side - the endpoint mixes
+// all event types in one chronological list).
+static bool fetchGoalEvents(long matchId, int goalTotal) {
+  if (WiFi.status() != WL_CONNECTED) return false;
+
+  WiFiClient client;
+  HTTPClient http;
+  http.setTimeout(12000);
+
+  String url = "http://" + String(SERVER_HOST) + ":" + String(SERVER_PORT) +
+               "/match/" + String(matchId) + "/events";
+  Serial.printf("[HTTP] GET %s\n", url.c_str());
+
+  gEventsMatchId   = matchId;
+  gEventsGoalTotal = goalTotal;
+  gGoalEventCount  = 0;
+  if (!http.begin(client, url)) return false;
+
+  int code = http.GET();
+  Serial.printf("[EVENTS] status=%d\n", code);
+  if (code != HTTP_CODE_OK) { http.end(); return false; }
+
+  JsonDocument filter;
+  filter["events"][0]["minute"]  = true;
+  filter["events"][0]["type"]    = true;
+  filter["events"][0]["team"]    = true;
+  filter["events"][0]["player"]  = true;
+  filter["events"][0]["assist"]  = true;
+  filter["events"][0]["ownGoal"] = true;
+  filter["events"][0]["penalty"] = true;
+
+  String payload = http.getString();
+  http.end();
+
+  JsonDocument doc;
+  DeserializationError err =
+      deserializeJson(doc, payload, DeserializationOption::Filter(filter));
+  if (err) {
+    Serial.printf("[EVENTS] JSON error: %s\n", err.c_str());
+    return false;
+  }
+
+  for (JsonObjectConst eo : doc["events"].as<JsonArrayConst>()) {
+    const char *type = eo["type"] | "";
+    if (strcmp(type, "goal") != 0) continue;
+    if (gGoalEventCount >= MAX_GOAL_EVENTS) break;
+
+    GoalEvent &g = gGoalEvents[gGoalEventCount];
+    g.minute = eo["minute"] | 0;
+    const char *team = eo["team"] | "home";
+    g.isHome = !strcmp(team, "home");
+    const char *pl = eo["player"] | "";
+    strncpy(g.player, pl, sizeof(g.player) - 1); g.player[sizeof(g.player) - 1] = '\0';
+    const char *as = eo["assist"] | "";
+    g.hasAssist = as[0] != '\0';
+    strncpy(g.assist, as, sizeof(g.assist) - 1); g.assist[sizeof(g.assist) - 1] = '\0';
+    g.ownGoal = eo["ownGoal"] | false;
+    g.penalty = eo["penalty"] | false;
+    gGoalEventCount++;
+  }
+
+  Serial.printf("[EVENTS] %d goal(s) parsed\n", gGoalEventCount);
+  return true;
+}
+
+// Draws the goal-scorer strip: one column per side, chronological, capped to
+// whatever the band fits. If a side has more goals than fit, the oldest ones
+// are dropped - the most recent goal is what matters most in a live match.
+static void drawHeroGoals() {
+  tft.fillRect(HERO_X + 2, HERO_GOALS_Y, HERO_W - 4, HERO_GOALS_H, COL_CARD);
+  if (gGoalEventCount == 0) return;
+
+  const int rowH    = 18;
+  const int maxRows = HERO_GOALS_H / rowH;
+
+  int homeTotal = 0, awayTotal = 0;
+  for (int i = 0; i < gGoalEventCount; i++)
+    if (gGoalEvents[i].isHome) homeTotal++; else awayTotal++;
+  int homeSkip = (homeTotal > maxRows) ? homeTotal - maxRows : 0;
+  int awaySkip = (awayTotal > maxRows) ? awayTotal - maxRows : 0;
+
+  setUiFont(16);
+  tft.setTextDatum(TL_DATUM);
+  tft.setTextColor(COL_TEXT, COL_CARD);
+
+  int homeX = HERO_X + 14, awayX = HERO_X + HERO_W / 2 + 6;
+  int homeSeen = 0, homeRow = 0, awaySeen = 0, awayRow = 0;
+
+  for (int i = 0; i < gGoalEventCount; i++) {
+    const GoalEvent &g = gGoalEvents[i];
+    char suffix[8] = "";
+    if (g.ownGoal)      strcpy(suffix, " (OG)");
+    else if (g.penalty) strcpy(suffix, " (pen)");
+
+    char line[48];
+    if (g.hasAssist)
+      snprintf(line, sizeof(line), "%d' %s%s (%s)", g.minute, lastToken(g.player), suffix, lastToken(g.assist));
+    else
+      snprintf(line, sizeof(line), "%d' %s%s", g.minute, lastToken(g.player), suffix);
+
+    if (g.isHome) {
+      if (homeSeen++ >= homeSkip) tft.drawString(line, homeX, HERO_GOALS_Y + homeRow++ * rowH);
+    } else {
+      if (awaySeen++ >= awaySkip) tft.drawString(line, awayX, HERO_GOALS_Y + awayRow++ * rowH);
+    }
+  }
+}
+
+// Keeps the goals strip in sync with the featured match: re-fetches when the
+// match changes or its goal tally has moved on since the last look, then
+// (re)draws. A no-score match (upcoming) just clears the strip once.
+static void updateHeroGoals(const Match &m) {
+  if (!matchHasScore(m)) {
+    if (m.id != gEventsMatchId) { gGoalEventCount = 0; gEventsMatchId = m.id; gEventsGoalTotal = -1; }
+  } else {
+    int goalTotal = m.homeGoals + m.awayGoals;
+    if (m.id != gEventsMatchId || goalTotal != gEventsGoalTotal) fetchGoalEvents(m.id, goalTotal);
+  }
+  drawHeroGoals();
 }
 
 // WiFi signal as 4 bars; level 0..4 derived from RSSI.
@@ -858,6 +1014,7 @@ static void drawFeatured() {
     gHeroDrawnId = matches[0].id;
   }
   drawHeroDynamic(matches[0]);
+  updateHeroGoals(matches[0]);
 
   heroShown  = true;
   heroIsLive = isLive(matches[0]);
