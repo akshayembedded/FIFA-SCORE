@@ -135,7 +135,7 @@ static const int CONTENT_H   = CONTENT_BOT - CONTENT_TOP;
 
 // Hero card geometry (centred in the content band on the FEATURED page)
 static const int HERO_X = 6;
-static const int HERO_H = 196;   // tall enough to fit the goals strip below the timer
+static const int HERO_H = 216;   // tall enough to fit the goals strip below the timer
 static const int HERO_Y = CONTENT_TOP + (CONTENT_H - HERO_H) / 2;
 static const int HERO_W = SCREEN_W - 12;
 
@@ -700,7 +700,17 @@ static int       gEventsGoalTotal = -1;   // home+away goals as of the last succ
 // Fetch + parse /match/{id}/events, keeping only "goal" entries (cards/subs/
 // delays are filtered out here rather than server-side - the endpoint mixes
 // all event types in one chronological list).
-static bool fetchGoalEvents(long matchId, int goalTotal) {
+//
+// gEventsGoalTotal is stamped from what we actually parsed (n), never from
+// the scoreline we were hoping to match - the server caches /live (20s) and
+// /match/{id}/events (30s) on different TTLs, so right after a fresh goal the
+// events list can still be one poll stale. Marking ourselves "caught up"
+// based on the target instead of the real count would latch onto that stale,
+// incomplete list permanently (a scorer just silently missing) since nothing
+// would ever look mismatched enough to retry. Leaving gEventsGoalTotal at the
+// real (lower) count means the next poll's comparison against the scoreline
+// still disagrees, so it keeps retrying until the server's own cache catches up.
+static bool fetchGoalEvents(long matchId) {
   if (WiFi.status() != WL_CONNECTED) return false;
 
   WiFiClient client;
@@ -711,9 +721,6 @@ static bool fetchGoalEvents(long matchId, int goalTotal) {
                "/match/" + String(matchId) + "/events";
   Serial.printf("[HTTP] GET %s\n", url.c_str());
 
-  gEventsMatchId   = matchId;
-  gEventsGoalTotal = goalTotal;
-  gGoalEventCount  = 0;
   if (!http.begin(client, url)) return false;
 
   int code = http.GET();
@@ -737,15 +744,17 @@ static bool fetchGoalEvents(long matchId, int goalTotal) {
       deserializeJson(doc, payload, DeserializationOption::Filter(filter));
   if (err) {
     Serial.printf("[EVENTS] JSON error: %s\n", err.c_str());
-    return false;
+    return false;   // keep whatever we already had rather than blanking the strip
   }
 
+  GoalEvent parsed[MAX_GOAL_EVENTS];
+  int n = 0;
   for (JsonObjectConst eo : doc["events"].as<JsonArrayConst>()) {
     const char *type = eo["type"] | "";
     if (strcmp(type, "goal") != 0) continue;
-    if (gGoalEventCount >= MAX_GOAL_EVENTS) break;
+    if (n >= MAX_GOAL_EVENTS) break;
 
-    GoalEvent &g = gGoalEvents[gGoalEventCount];
+    GoalEvent &g = parsed[n];
     g.minute = eo["minute"] | 0;
     const char *team = eo["team"] | "home";
     g.isHome = !strcmp(team, "home");
@@ -756,67 +765,120 @@ static bool fetchGoalEvents(long matchId, int goalTotal) {
     strncpy(g.assist, as, sizeof(g.assist) - 1); g.assist[sizeof(g.assist) - 1] = '\0';
     g.ownGoal = eo["ownGoal"] | false;
     g.penalty = eo["penalty"] | false;
-    gGoalEventCount++;
+    n++;
   }
 
-  Serial.printf("[EVENTS] %d goal(s) parsed\n", gGoalEventCount);
+  memcpy(gGoalEvents, parsed, sizeof(GoalEvent) * n);
+  gGoalEventCount  = n;
+  gEventsMatchId   = matchId;
+  gEventsGoalTotal = n;
+
+  Serial.printf("[EVENTS] %d goal(s) parsed\n", n);
   return true;
 }
 
-// Draws the goal-scorer strip: one column per side, chronological, capped to
-// whatever the band fits. If a side has more goals than fit, the oldest ones
-// are dropped - the most recent goal is what matters most in a live match.
+// Every goal is shown on its own line (scorer + assist, never collapsed) so
+// assists are never hidden - a side with more goals than the strip can show
+// at once scrolls instead, one entry sliding in every GOAL_SCROLL_MS.
+static const uint32_t GOAL_SCROLL_MS = 2500;
+static int      gHomeScrollOff = 0, gAwayScrollOff = 0;
+static uint32_t gGoalScrollLastMs = 0;
+
+// One column's worth of goal lines: up to maxRows entries starting at
+// `offset` (wrapping), or all of them straight from the top if they all fit.
+static void drawGoalColumn(const GoalEvent *const *list, int count, int x, int maxRows, int rowH, int offset) {
+  int show = (count < maxRows) ? count : maxRows;
+  bool scrolling = count > maxRows;
+  for (int r = 0; r < show; r++) {
+    int idx = scrolling ? (offset + r) % count : r;
+    const GoalEvent &g = *list[idx];
+
+    char suffix[8] = "";
+    if (g.ownGoal)      strcpy(suffix, " (OG)");
+    else if (g.penalty) strcpy(suffix, " (pen)");
+
+    char line[56];
+    if (g.hasAssist)
+      snprintf(line, sizeof(line), "%d' %s%s (%s)", g.minute, lastToken(g.player), suffix, lastToken(g.assist));
+    else
+      snprintf(line, sizeof(line), "%d' %s%s", g.minute, lastToken(g.player), suffix);
+
+    tft.drawString(line, x, HERO_GOALS_Y + r * rowH);
+  }
+}
+
+// Draws the goal-scorer strip: one column per side, every individual goal
+// (with its own assist) listed - each column scrolls independently if it has
+// more goals than the strip's fixed row budget can show at once.
 static void drawHeroGoals() {
   tft.fillRect(HERO_X + 2, HERO_GOALS_Y, HERO_W - 4, HERO_GOALS_H, COL_CARD);
   if (gGoalEventCount == 0) return;
 
+  const GoalEvent *home[MAX_GOAL_EVENTS]; int homeCount = 0;
+  const GoalEvent *away[MAX_GOAL_EVENTS]; int awayCount = 0;
+  for (int i = 0; i < gGoalEventCount; i++) {
+    const GoalEvent &g = gGoalEvents[i];
+    if (g.isHome) home[homeCount++] = &g;
+    else          away[awayCount++] = &g;
+  }
+
   const int rowH    = 18;
   const int maxRows = HERO_GOALS_H / rowH;
-
-  int homeTotal = 0, awayTotal = 0;
-  for (int i = 0; i < gGoalEventCount; i++)
-    if (gGoalEvents[i].isHome) homeTotal++; else awayTotal++;
-  int homeSkip = (homeTotal > maxRows) ? homeTotal - maxRows : 0;
-  int awaySkip = (awayTotal > maxRows) ? awayTotal - maxRows : 0;
 
   setUiFont(16);
   tft.setTextDatum(TL_DATUM);
   tft.setTextColor(COL_TEXT, COL_CARD);
 
   int homeX = HERO_X + 14, awayX = HERO_X + HERO_W / 2 + 6;
-  int homeSeen = 0, homeRow = 0, awaySeen = 0, awayRow = 0;
-
-  for (int i = 0; i < gGoalEventCount; i++) {
-    const GoalEvent &g = gGoalEvents[i];
-    char suffix[8] = "";
-    if (g.ownGoal)      strcpy(suffix, " (OG)");
-    else if (g.penalty) strcpy(suffix, " (pen)");
-
-    char line[48];
-    if (g.hasAssist)
-      snprintf(line, sizeof(line), "%d' %s%s (%s)", g.minute, lastToken(g.player), suffix, lastToken(g.assist));
-    else
-      snprintf(line, sizeof(line), "%d' %s%s", g.minute, lastToken(g.player), suffix);
-
-    if (g.isHome) {
-      if (homeSeen++ >= homeSkip) tft.drawString(line, homeX, HERO_GOALS_Y + homeRow++ * rowH);
-    } else {
-      if (awaySeen++ >= awaySkip) tft.drawString(line, awayX, HERO_GOALS_Y + awayRow++ * rowH);
-    }
-  }
+  drawGoalColumn(home, homeCount, homeX, maxRows, rowH, gHomeScrollOff);
+  drawGoalColumn(away, awayCount, awayX, maxRows, rowH, gAwayScrollOff);
 }
 
-// Keeps the goals strip in sync with the featured match: re-fetches when the
-// match changes or its goal tally has moved on since the last look, then
-// (re)draws. A no-score match (upcoming) just clears the strip once.
-static void updateHeroGoals(const Match &m) {
+// Advances each column's scroll position by one entry, if (and only if) that
+// column actually has more goals than fit at once. Called on a timer from
+// loop() - see GOAL_SCROLL_MS. Returns true if anything actually moved, so
+// the caller can skip a redraw when nothing needed to scroll.
+static bool tickGoalScroll() {
+  int maxRows = HERO_GOALS_H / 18;
+  int homeCount = 0, awayCount = 0;
+  for (int i = 0; i < gGoalEventCount; i++)
+    if (gGoalEvents[i].isHome) homeCount++; else awayCount++;
+
+  bool moved = false;
+  if (homeCount > maxRows) { gHomeScrollOff = (gHomeScrollOff + 1) % homeCount; moved = true; }
+  if (awayCount > maxRows) { gAwayScrollOff = (gAwayScrollOff + 1) % awayCount; moved = true; }
+  return moved;
+}
+
+// Keeps the loaded goal list in sync with the top-ranked match. Called every
+// poll cycle from fetchMatches() - NOT gated on the score having changed
+// *this* cycle, unlike the old version. That gate was the bug: once the
+// scoreline stopped moving, nothing would ever look mismatched enough to
+// retry a fetch that had raced a stale server-side cache, so a scorer that
+// got missed on the one poll that mattered stayed missing forever. Returns
+// true if the caller should repaint the strip (only meaningful when the
+// Featured page is actually on screen).
+static bool refreshGoalEvents(const Match &m) {
   if (!matchHasScore(m)) {
-    if (m.id != gEventsMatchId) { gGoalEventCount = 0; gEventsMatchId = m.id; gEventsGoalTotal = -1; }
-  } else {
-    int goalTotal = m.homeGoals + m.awayGoals;
-    if (m.id != gEventsMatchId || goalTotal != gEventsGoalTotal) fetchGoalEvents(m.id, goalTotal);
+    if (m.id != gEventsMatchId) {
+      gGoalEventCount = 0; gEventsMatchId = m.id; gEventsGoalTotal = -1;
+      gHomeScrollOff = gAwayScrollOff = 0;
+      return true;
+    }
+    return false;
   }
-  drawHeroGoals();
+
+  int  goalTotal = m.homeGoals + m.awayGoals;
+  bool newMatch  = (m.id != gEventsMatchId);
+  if (newMatch) {
+    gGoalEventCount = 0;   // don't show the previous match's scorers under the new team names
+    gHomeScrollOff = gAwayScrollOff = 0;
+  } else if (goalTotal == gEventsGoalTotal) {
+    return false;          // already caught up - nothing to do
+  }
+
+  fetchGoalEvents(m.id);   // on failure, gEventsMatchId/gEventsGoalTotal stay behind -> retried next poll
+  return true;
 }
 
 // WiFi signal as 4 bars; level 0..4 derived from RSSI.
@@ -1014,7 +1076,7 @@ static void drawFeatured() {
     gHeroDrawnId = matches[0].id;
   }
   drawHeroDynamic(matches[0]);
-  updateHeroGoals(matches[0]);
+  drawHeroGoals();   // fetching is handled per-poll by refreshGoalEvents(), not here
 
   heroShown  = true;
   heroIsLive = isLive(matches[0]);
@@ -1727,6 +1789,13 @@ static bool fetchMatches() {
     if (isLive(matches[i])) { gAnyLive = true; break; }
   if (matchCount > 0) trackHalfTime(matches[0]);
 
+  // Keep the goal-scorer strip's data fresh every poll, independent of
+  // whether anything else changed this cycle (see refreshGoalEvents()).
+  if (matchCount > 0 && refreshGoalEvents(matches[0]) &&
+      gPage == PAGE_FEATURED && heroShown) {
+    drawHeroGoals();
+  }
+
   if (matchCount == 0) strcpy(statusLine, "No matches right now");
   return true;
 }
@@ -1884,5 +1953,12 @@ void loop() {
       drawHeader();
     }
     if (gPage == PAGE_FEATURED && heroShown && heroIsLive) drawLiveTimer();
+  }
+
+  // Advance the goal-scorer strip's scroll position on its own slower timer,
+  // only redrawing when a column actually has more goals than fit at once.
+  if (gPage == PAGE_FEATURED && heroShown && now - gGoalScrollLastMs >= GOAL_SCROLL_MS) {
+    gGoalScrollLastMs = now;
+    if (tickGoalScroll()) drawHeroGoals();
   }
 }
